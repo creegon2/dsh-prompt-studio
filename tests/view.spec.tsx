@@ -40,6 +40,8 @@ function renderStudio(components: PromptStudioState['components'] = []) {
     messageCount: 2,
     userAnchor: 0,
     catalogRevision: 4,
+    variables: {},
+    input: { current: { system: 'Persona.', tools: [], assembledAt: '2026-10-19T00:00:00Z' }, latest: null },
   }
   const controller = {
     load: vi.fn(() => Promise.resolve()),
@@ -48,8 +50,9 @@ function renderStudio(components: PromptStudioState['components'] = []) {
     saveResource: vi.fn(() => Promise.resolve({ path: 'AGENTS.md', content: 'Be concise.\n', digest: 'next' })),
   } as unknown as PromptStudioStore
   const useSnapshot = (<T,>(selector: (state: PromptStudioState) => T): T => selector(remote))
-  const useSession = (<T,>(selector: (state: { nodes: unknown[]; running: boolean }) => T): T => selector({ nodes: [], running: false }))
+  const useSession = (<T,>(selector: (state: { running: boolean; openState: string }) => T): T => selector({ openState: 'open', running: false }))
   render(<PromptStudioView {...({ controller, useSnapshot, useSession } as unknown as PromptStudioViewProps)} />)
+  fireEvent.click(screen.getByRole('button', { name: 'System 编辑器' }))
   return { controller }
 }
 
@@ -60,7 +63,7 @@ describe('PromptStudioView automatic context rows', () => {
     expect(within(card).getByText(/workspace-instructions · kind=workspace-instructions · form=instructions/)).toBeTruthy()
     fireEvent.click(within(card).getByRole('button', { name: '查看' }))
     expect(within(card).getByText(/Instructions from: AGENTS.md/)).toBeTruthy()
-    expect(screen.getByLabelText('完整请求预览').textContent).toContain('自动捕获')
+    expect(screen.getByLabelText('System 草稿与历史上下文参考').textContent).toContain('自动捕获')
   })
 
   it('loads raw file bytes and writes them through the source-resource route', async () => {

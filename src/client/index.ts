@@ -1,6 +1,7 @@
 /** Prompt Studio browser half: one live conversation-view contribution. */
 import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
-import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-web-react'
+import { useSyncExternalStore } from 'react'
+import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
@@ -20,6 +21,12 @@ export type { PromptStudioViewInjected, PromptStudioViewProps } from './PromptSt
 
 /** Slot registry, declaration-order edge, and settings transport. */
 export const inject = ['slots', 'conversation', 'connection', 'remote']
+
+function bindSnapshotSelector<T>(store: SnapshotStore<T>) {
+  return function useSnapshot<R>(select: (state: T) => R): R {
+    return select(useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot))
+  }
+}
 
 /** Register the tab, its shared controller, and pushed invalidations. */
 export function apply(ctx: ClientContext): void {
@@ -47,13 +54,13 @@ export function apply(ctx: ClientContext): void {
     return () => { for (const dispose of disposers) dispose() }
   }, 'ui-prompt-studio: pushed invalidations')
 
-  ctx.slots.register({
+  ctx.slots.inject('conversation.view', () => ctx.slots.register({
     name: 'conversation.view',
     id: 'prompt-studio',
       order: PROMPT_STUDIO_VIEW_ORDER,
       label: 'Prompt Studio',
       inject: (sessionId: SessionId) => faceFor(sessionId),
-  }, PromptStudioView)
+  }, PromptStudioView))
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
     id: 'prompt-studio',

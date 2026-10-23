@@ -1,8 +1,9 @@
 /** Browser controller for the prompt-studio settings and runtime inventory. */
-import type { SnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import {
   PROMPT_STUDIO_RESOURCE_PATH,
+  PROMPT_STUDIO_INPUT_PATH,
   PROMPT_STUDIO_SETTINGS_PATH,
   PROMPT_STUDIO_STATE_PATH,
   validatePromptComponents,
@@ -16,6 +17,7 @@ import {
   type PromptStudioSettingsSnapshot,
   type RuntimePromptCatalog,
   type StudioConfig,
+  type ModelInputCatalog,
 } from '../shared.ts'
 
 /** Remote state consumed by the conversation view. */
@@ -32,6 +34,8 @@ export interface PromptStudioState {
   messageCount: number
   userAnchor: number | null
   catalogRevision: number
+  variables: Record<string, string | undefined>
+  input: ModelInputCatalog | null
 }
 
 function messageOf(error: unknown): string {
@@ -165,6 +169,7 @@ function decodeCatalog(value: unknown): RuntimePromptCatalog {
     throw new TypeError('prompt-studio runtime catalog is not an object')
   }
   const candidate = value as {
+    variables?: Record<string, string | undefined>
     revision?: unknown
     native?: unknown
     assembled?: unknown
@@ -187,6 +192,7 @@ function decodeCatalog(value: unknown): RuntimePromptCatalog {
   }
   return {
     revision: candidate.revision,
+    variables: candidate.variables ?? {},
     native: decodeComponents(candidate.native, 'native catalog', true),
     assembled: decodeComponents(candidate.assembled, 'assembled catalog', true),
     ...candidate.sessionId === undefined ? {} : { sessionId: candidate.sessionId },
@@ -265,6 +271,17 @@ async function loadCatalog(sessionId?: string): Promise<RuntimePromptCatalog> {
   return decodeCatalog(await responseValue(response))
 }
 
+async function loadInput(sessionId?: string): Promise<ModelInputCatalog> {
+  const query = sessionId === undefined ? '' : `?sessionId=${encodeURIComponent(sessionId)}`
+  const response = await fetch(`${PROMPT_STUDIO_INPUT_PATH}${query}`, { cache: 'no-store', headers: { accept: 'application/json' } })
+  const value = await responseValue(response) as ModelInputCatalog
+  if (typeof value.current?.system !== 'string' || !Array.isArray(value.current.tools)
+    || (value.latest !== null && !Array.isArray(value.latest?.request.messages))) {
+    throw new Error('完整模型输入格式无效。')
+  }
+  return value
+}
+
 /** One browser-side controller, shared by every session-scoped mount of the view. */
 export class PromptStudioStore {
   /** Observable remote namespace state consumed by every mounted Prompt Studio view. */
@@ -281,6 +298,8 @@ export class PromptStudioStore {
     messageCount: 0,
     userAnchor: null,
     catalogRevision: 0,
+    variables: {},
+    input: null,
   })
 
   private generation = 0
@@ -295,12 +314,13 @@ export class PromptStudioStore {
       state.error = null
     })
     try {
-      const [settings, catalog] = await Promise.all([
+      const [settings, input] = await Promise.all([
         loadSettings(),
-        loadCatalog(this.sessionId),
+        loadInput(this.sessionId),
       ])
+      const catalog = await loadCatalog(this.sessionId)
       if (generation !== this.generation) return
-      this.accept(settings, catalog)
+      this.accept(settings, catalog, input)
     } catch (error) {
       if (generation !== this.generation) return
       this.store.update((state) => {
@@ -327,8 +347,9 @@ export class PromptStudioStore {
     })
     const settings = decodeSettings(await responseValue(response))
     const catalog = await loadCatalog(this.sessionId)
+    const input = await loadInput(this.sessionId)
     if (generation !== this.generation) return
-    this.accept(settings, catalog)
+    this.accept(settings, catalog, input)
   }
 
   /** Load one raw file selected by a captured instructions-form context. */
@@ -371,6 +392,7 @@ export class PromptStudioStore {
   private accept(
     settings: PromptStudioSettingsSnapshot,
     catalog: RuntimePromptCatalog,
+    input: ModelInputCatalog,
   ): void {
     this.store.update((state) => {
       state.status = 'ready'
@@ -385,6 +407,8 @@ export class PromptStudioStore {
       state.messageCount = catalog.layout.messageCount
       state.userAnchor = catalog.layout.userAnchor
       state.catalogRevision = catalog.revision
+      state.variables = catalog.variables ?? {}
+      state.input = input
     })
   }
 }

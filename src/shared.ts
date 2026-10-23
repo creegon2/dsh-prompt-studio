@@ -10,6 +10,24 @@ export const PROMPT_STUDIO_SETTINGS_PATH = '/prompt-studio/settings'
 /** Same-origin endpoint for resources declared by captured context producers. */
 export const PROMPT_STUDIO_RESOURCE_PATH = '/prompt-studio/resource'
 
+/** Complete logical calls use dsh's authenticated browser API. */
+export const PROMPT_STUDIO_INPUT_PATH = '/api/prompt-studio/input'
+
+export interface ModelInputSnapshot {
+  version: 1
+  source: 'captured' | 'reconstructed'
+  sessionId: string
+  recordedAt: string
+  boundarySeq?: number
+  request: Record<string, unknown> & { messages: Record<string, unknown>[]; tools?: Record<string, unknown>[] }
+}
+
+export interface ModelInputCatalog {
+  current: { system: string; tools: Record<string, unknown>[]; assembledAt: string }
+  latest: ModelInputSnapshot | null
+  error?: string
+}
+
 /** Conversation-view placement: Chat is 0 and Trajectory is 10. */
 export const PROMPT_STUDIO_VIEW_ORDER = 20
 
@@ -51,6 +69,8 @@ export interface PromptComponent {
 /** Resolved value of the prompt-studio settings namespace. */
 export interface StudioConfig {
   components: PromptComponent[]
+  /** Value of `{{user}}` / `<user>` in Studio sections; empty leaves both as written. */
+  userName?: string
 }
 
 /** Browser-safe snapshot of the plugin-owned settings namespace. */
@@ -102,6 +122,7 @@ export interface RuntimeRequestLayout {
 /** Runtime state returned by the Host inventory endpoint. */
 export interface RuntimePromptCatalog {
   revision: number
+  variables?: Record<string, string | undefined>
   native: PromptComponent[]
   /** Effective system-section sequence from the latest real assembly. */
   assembled: PromptComponent[]
@@ -259,9 +280,48 @@ export function buildDraftSystemComponents(
     .map(entry => entry.component)
 }
 
+/**
+ * Substitute registered prompt variables; any other `{{…}}` group (e.g. a chat-template `{{user}}`) stays literal.
+ * Shared by the preview and the request path so Studio text renders the same in both.
+ */
+export function renderKnownVariables(text: string, variables: Record<string, string | undefined>): string {
+  return text.replace(/\{\{([a-z][a-z0-9_]*)\}\}/g, (reference, key: string) => variableValue(variables, key) ?? reference)
+}
+
+/**
+ * Studio text: registered variables plus the SillyTavern-style `<user>` alias of `{{user}}`; anything else stays
+ * literal. `{{user}}` is only registered when the `userName` setting is non-empty, so by default both stay as written.
+ */
+export function renderStudioText(text: string, variables: Record<string, string | undefined>): string {
+  return text.replace(/<[Uu][Ss][Ee][Rr]>|\{\{([a-z][a-z0-9_]*)\}\}/g, (reference, key?: string) =>
+    variableValue(variables, key ?? 'user') ?? reference)
+}
+
+function variableValue(variables: Record<string, string | undefined>, key: string): string | undefined {
+  return Object.hasOwn(variables, key) ? variables[key] : undefined
+}
+
+/**
+ * Studio sections are user-written prose that may carry chat-template placeholders such as `{{user}}`.
+ * Render them like the preview and mark them non-interpolating, so one unregistered placeholder cannot
+ * fail the whole Host assembly (the Host renderer throws on unknown variables).
+ */
+export function renderStudioSections(
+  assembly: { sections: { name: string; text: string; interpolate?: boolean }[]; variables: Record<string, string | undefined> },
+  ownedSectionNames: ReadonlySet<string>,
+): void {
+  assembly.sections = assembly.sections.map(section =>
+    section.interpolate === false || !ownedSectionNames.has(section.name)
+      ? section
+      : { ...section, text: renderStudioText(section.text, assembly.variables), interpolate: false })
+}
+
 /** Concatenate enabled system components using the Host renderer's blank-line rule. */
-export function renderSystemPreview(components: readonly PromptComponent[]): string {
-  return components.map(component => component.template).filter(text => text.length > 0).join('\n\n')
+export function renderSystemPreview(components: readonly PromptComponent[], variables?: Record<string, string | undefined>): string {
+  return components.map(component => variables === undefined
+    ? component.template
+    : (component.kind === 'native' ? renderKnownVariables : renderStudioText)(component.template, variables))
+    .filter(text => text.length > 0).join('\n\n')
 }
 
 /** Allocate the first readable supplement id absent from a component draft. */

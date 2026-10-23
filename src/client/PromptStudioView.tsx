@@ -19,6 +19,7 @@ import {
 } from '../shared.ts'
 import type { PromptStudioState, PromptStudioStore } from './store.ts'
 import styles from './PromptStudioView.module.css'
+import { ModelInputView } from './ModelInputView.tsx'
 
 /** Business face supplied by the slot registration. */
 export interface PromptStudioViewInjected {
@@ -268,7 +269,7 @@ function CapturedComponentCard({
 
 /** Conversation-view entry point. */
 export function PromptStudioView({ controller, useSnapshot, useSession }: PromptStudioViewProps): ReactNode {
-  const requestVersion = useSession(snapshot => `${String(snapshot.nodes.length)}:${snapshot.running ? 'running' : 'idle'}`)
+  const requestVersion = useSession(snapshot => `${snapshot.openState}:${snapshot.running ? 'running' : 'idle'}`)
   useEffect(() => { void controller.load() }, [controller, requestVersion])
   return <PromptStudioSurface controller={controller} useSnapshot={useSnapshot} />
 }
@@ -284,6 +285,7 @@ export function PromptStudioSettingsSection({
 
 function PromptStudioSurface({ controller, useSnapshot }: InjectFace<PromptStudioViewInjected>): ReactNode {
   const remote = useSnapshot(state => state)
+  const [page, setPage] = useState<'input' | 'editor'>('input')
 
   if (remote.status === 'idle' || (remote.status === 'loading' && remote.native.length === 0)) {
     return <div className={styles['status']}>正在载入 Prompt Studio…</div>
@@ -298,7 +300,14 @@ function PromptStudioSurface({ controller, useSnapshot }: InjectFace<PromptStudi
       </div>
     )
   }
-  return <PromptStudioEditor controller={controller} remote={remote} />
+  return <div className={styles['surface']}>
+    <nav className={styles['pageTabs']} aria-label="Prompt Studio 页面">
+      <button className={page === 'input' ? styles['categoryActive'] : styles['categoryButton']} aria-pressed={page === 'input'} onClick={() => setPage('input')}>完整模型输入</button>
+      <button className={page === 'editor' ? styles['categoryActive'] : styles['categoryButton']} aria-pressed={page === 'editor'} onClick={() => setPage('editor')}>System 编辑器</button>
+    </nav>
+    <div className={styles['pageBody']} hidden={page !== 'input'}><ModelInputView input={remote.input} refresh={() => { void controller.load() }} /></div>
+    <div className={styles['pageBody']} hidden={page !== 'editor'}><PromptStudioEditor controller={controller} remote={remote} /></div>
+  </div>
 }
 
 function PromptStudioEditor({
@@ -313,6 +322,8 @@ function PromptStudioEditor({
   const [editingIndex, setEditingIndex] = useState<number | null>(null)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  const lastRequestSystem = remote.captured.find(component => component.role === 'system' && component.sourceKind === 'system-prompt')
+  const capturedContext = useMemo(() => remote.captured.filter(component => component !== lastRequestSystem), [remote.captured, lastRequestSystem])
 
   useEffect(() => {
     setDraft(copyComponents(remote.components))
@@ -324,9 +335,9 @@ function PromptStudioEditor({
 
   const rows = useMemo<DisplayRow[]>(() => [
     ...remote.native.map(component => ({ type: 'native' as const, component })),
-    ...remote.captured.map(component => ({ type: 'captured' as const, component })),
+    ...capturedContext.map(component => ({ type: 'captured' as const, component })),
     ...draft.map((component, configuredIndex) => ({ type: 'configured' as const, component, configuredIndex })),
-  ].sort(compareRows), [draft, remote.captured, remote.native])
+  ].sort(compareRows), [draft, capturedContext, remote.native])
 
   const draftSystem = useMemo(
     () => dirty ? buildDraftSystemComponents(remote.native, draft) : copyComponents(remote.assembled),
@@ -344,10 +355,10 @@ function PromptStudioEditor({
       || left.component.order - right.component.order
       || left.declaration - right.declaration)
     .map(entry => entry.component), [requestSupplements])
-  const systemContent = useMemo(() => renderSystemPreview(draftSystem), [draftSystem])
+  const systemContent = useMemo(() => renderSystemPreview(draftSystem, dirty ? remote.variables : undefined), [draftSystem, dirty, remote.variables])
   const preview = useMemo(
-    () => previewText(systemContent, orderedRequestSupplements, remote.captured, remote.userAnchor),
-    [orderedRequestSupplements, remote.captured, remote.userAnchor, systemContent],
+    () => previewText(systemContent, orderedRequestSupplements, capturedContext, remote.userAnchor),
+    [orderedRequestSupplements, capturedContext, remote.userAnchor, systemContent],
   )
 
   const changeComponent = (index: number, patch: Partial<PromptComponent>): void => {
@@ -448,9 +459,10 @@ function PromptStudioEditor({
       <div className={styles['pageHeader']}>
         <div>
           <h1 className={styles['title']}>Prompt Studio</h1>
-
+          <p className={styles['intro']}>右侧预览当前 System 草稿，历史注入上下文仅供参考；真实输入请看“完整模型输入”。左侧创建逐段覆盖，未修改段落保持原样。保存影响 web 配置下的会话。</p>
         </div>
         <div className={styles['headerActions']}>
+          <button type="button" className={styles['secondaryButton']} disabled={dirty || saving} onClick={() => { void controller.load() }}>刷新全文</button>
           <button type="button" className={styles['secondaryButton']} disabled={!remote.writable} onClick={addSupplement}>
             新增补充
           </button>
@@ -652,16 +664,20 @@ function PromptStudioEditor({
           </ol>
         </section>
 
-        <section className={styles['previewColumn']} aria-label="完整请求预览">
+        <section className={styles['previewColumn']} aria-label="System 草稿与历史上下文参考">
           <div className={styles['sectionHeading']}>
             <div>
-              <h2 className={styles['subtitle']}>完整预览</h2>
+              <h2 className={styles['subtitle']}>System 草稿与上下文参考</h2>
 
             </div>
             <span className={styles['count']}>
               {String(preview.length)}
             </span>
           </div>
+          {lastRequestSystem === undefined ? null : <details>
+            <summary>最近一次真实请求的 system prompt（历史快照）</summary>
+            <pre className={styles['previewSystem']}>{lastRequestSystem.template}</pre>
+          </details>}
           <div className={styles['assemblyOrder']}>
             {preview.map((block, index) => (
               <span key={`layout:${block.kind}:${block.id ?? 'system'}:${String(index)}`} className={styles['assemblyRow']}>

@@ -2,6 +2,9 @@
 /** Host half of Prompt Studio: reversible component activation and request-local composition. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {
@@ -11,15 +14,17 @@ import type {
   MessageId,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import type { SettingsNamespace, SettingsScope } from '@deepseek-ai/dsh-settings'
+import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type {
   AssembledSection,
   AssembleContext,
   PromptAssembly,
 } from '@deepseek-ai/dsh-system-prompt'
+import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { studioConfigSchema } from './config.ts'
 import { captureInjectedMessages, requestLayout } from './capture.ts'
+import { captureModelInput, ModelInputStore, reconstructModelInput } from './input.ts'
 import {
   CapturedResourceConflictError,
   CapturedResourceNotFoundError,
@@ -28,13 +33,16 @@ import {
 } from './resource.ts'
 import {
   PROMPT_STUDIO_MESSAGE_SOURCE,
+  PROMPT_STUDIO_INPUT_PATH,
   PROMPT_STUDIO_NAMESPACE,
   PROMPT_STUDIO_OVERRIDE_MARKER_PREFIX,
   PROMPT_STUDIO_RESOURCE_PATH,
   PROMPT_STUDIO_SETTINGS_PATH,
   PROMPT_STUDIO_STATE_PATH,
   isNativeOverride,
+  renderStudioSections,
   renderSupplementBoundary,
+  renderSystemPreview,
   validatePromptComponents,
   type CapturedPromptComponent,
   type NativeOverride,
@@ -42,6 +50,7 @@ import {
   type PromptStudioSettingsSnapshot,
   type RuntimePromptCatalog,
   type StudioConfig,
+  type ModelInputCatalog,
 } from './shared.ts'
 
 export {
@@ -78,9 +87,10 @@ export const PROMPT_STUDIO_SETTINGS_NAMESPACE = PROMPT_STUDIO_NAMESPACE as Setti
 
 /** Stable Cordis plugin name. */
 export const name = 'client-ui-prompt-studio'
+export const Config = studioConfigSchema
 
 /** Host services required by the component and request pipelines. */
-export const inject = ['settings', 'systemPrompt', 'llm', 'sessions']
+export const inject = ['settings', 'systemPrompt', 'llm', 'sessions', 'agents']
 
 const SYSTEM_SECTION_PREFIX = 'prompt-studio:supplement-section:'
 
@@ -191,14 +201,13 @@ function applyOverrides(
     replacedTargets.add(override.origin)
     matchedOverrideIds.add(override.id)
   }
+  const sectionsByName = new Map(assembly.sections.map(section => [section.name, section]))
   assembly.sections = assembly.sections.flatMap((section) => {
-    const override = overridesByMarker.get(section.name)
-    if (override !== undefined) {
-      return matchedMarkers.has(section.name) && override.enabled && override.role === 'system'
-        ? [section]
-        : []
-    }
-    return replacedTargets.has(section.name) ? [] : [section]
+    if (overridesByMarker.has(section.name)) return []
+    if (!replacedTargets.has(section.name)) return [section]
+    const marker = markerName(section.name)
+    const override = overridesByMarker.get(marker)!
+    return override.enabled && override.role === 'system' ? [sectionsByName.get(marker)!] : []
   })
   return matchedOverrideIds
 }
@@ -243,6 +252,8 @@ function effectiveAssembly(
 
 /** Latest value-level snapshot of the runtime registry. */
 class RuntimeCatalogStore {
+  private readonly tools = new Map<string, Record<string, unknown>[]>()
+  private readonly assemblyTimes = new Map<string, string>()
   private revision = 0
   private native: PromptComponent[] = []
   private assembled: PromptComponent[] = []
@@ -251,10 +262,25 @@ class RuntimeCatalogStore {
     layout: RuntimePromptCatalog['layout']
   }>()
   private latestSessionId: string | undefined
+  private readonly prompts = new Map<string, { native: PromptComponent[]; assembled: PromptComponent[]; variables: Record<string, string | undefined> }>()
 
-  commit(native: readonly PromptComponent[], assembled: readonly PromptComponent[]): void {
+  commitTools(sessionId: string, tools: unknown): void {
+    this.tools.set(sessionId, JSON.parse(JSON.stringify(tools ?? [])))
+    this.assemblyTimes.set(sessionId, new Date().toISOString())
+  }
+
+  currentInput(sessionId?: string): ModelInputCatalog['current'] {
+    return {
+      system: renderSystemPreview(this.snapshot(sessionId).assembled),
+      tools: structuredClone(this.tools.get(sessionId ?? '') ?? []),
+      assembledAt: this.assemblyTimes.get(sessionId ?? '') ?? new Date().toISOString(),
+    }
+  }
+
+  commit(native: readonly PromptComponent[], assembled: readonly PromptComponent[], sessionId?: string, variables: Record<string, string | undefined> = {}): void {
     const nextNative = native.map(cloneComponent)
     const nextAssembled = assembled.map(cloneComponent)
+    if (sessionId !== undefined) this.prompts.set(sessionId, { native: nextNative, assembled: nextAssembled, variables: { ...variables } })
     if (
       JSON.stringify(nextNative) === JSON.stringify(this.native)
       && JSON.stringify(nextAssembled) === JSON.stringify(this.assembled)
@@ -279,10 +305,12 @@ class RuntimeCatalogStore {
   snapshot(requestedSessionId?: string): RuntimePromptCatalog {
     const sessionId = requestedSessionId ?? this.latestSessionId
     const request = sessionId === undefined ? undefined : this.requests.get(sessionId)
+    const prompt = sessionId === undefined ? undefined : this.prompts.get(sessionId)
     return {
       revision: this.revision,
-      native: this.native.map(cloneComponent),
-      assembled: this.assembled.map(cloneComponent),
+      variables: { ...prompt?.variables },
+      native: (prompt?.native ?? this.native).map(cloneComponent),
+      assembled: (prompt?.assembled ?? this.assembled).map(cloneComponent),
       ...sessionId === undefined ? {} : { sessionId },
       captured: request === undefined ? [] : structuredClone(request.captured),
       layout: request === undefined
@@ -303,8 +331,9 @@ class RuntimeCatalogStore {
 }
 
 function latestUserInput(agent: Agent): string | undefined {
-  for (let index = agent.session.events.length - 1; index >= 0; index -= 1) {
-    const event = agent.session.events[index]
+  const events = agent.session.snapshotEvents()
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
     if (event?.type !== 'user/message') continue
     return event.data.content
       .filter(block => block.type === 'text')
@@ -505,14 +534,20 @@ function installRoutes(ctx: Context, catalog: RuntimeCatalogStore): void {
     routeCtx.effect(() => routeCtx.webServer.register({
       kind: 'exact',
       path: PROMPT_STUDIO_STATE_PATH,
-      handler: (request, response) => {
+      handler: async (request, response) => {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           response.writeHead(405)
           response.end()
           return
         }
         const sessionId = requestUrl(request).searchParams.get('sessionId') ?? undefined
-        respondJson(response, 200, catalog.snapshot(sessionId), request.method === 'HEAD')
+        const agent = sessionId === undefined ? undefined : routeCtx.agents.get(sessionId as SessionId)
+        try {
+          if (agent !== undefined) await routeCtx.systemPrompt.assemble({ scope: agent, agent })
+          respondJson(response, 200, catalog.snapshot(sessionId), request.method === 'HEAD')
+        } catch (error) {
+          respondJson(response, 500, { error: String(error) })
+        }
       },
     }), 'prompt-studio: runtime catalog route')
     routeCtx.effect(() => routeCtx.webServer.register({
@@ -526,9 +561,11 @@ function installRoutes(ctx: Context, catalog: RuntimeCatalogStore): void {
           }
           if (request.method === 'POST') {
             const update = settingsUpdate(await requestJson(request))
+            // Keep the other settings (e.g. userName) when the editor saves its components.
+            const current = routeCtx.settings.describe().find(row => row.ns === PROMPT_STUDIO_SETTINGS_NAMESPACE)?.value
             await routeCtx.settings.replace(
               PROMPT_STUDIO_SETTINGS_NAMESPACE,
-              { components: update.components },
+              { ...(current as Partial<StudioConfig> | undefined), components: update.components },
               update.expectedRevision,
             )
             respondJson(response, 200, settingsSnapshot(routeCtx))
@@ -576,26 +613,60 @@ function installRoutes(ctx: Context, catalog: RuntimeCatalogStore): void {
   })
 }
 
+function installInputRoute(ctx: Context, catalog: RuntimeCatalogStore, inputs: ModelInputStore): void {
+  ctx.inject(['connection'], (routeCtx) => {
+    routeCtx.effect(() => routeCtx.connection.fetch.register({
+      path: PROMPT_STUDIO_INPUT_PATH,
+      methods: ['GET'], requestBody: 'buffered',
+      fetch: async (request) => {
+        const sessionId = new URL(request.url).searchParams.get('sessionId') ?? catalog.snapshot().sessionId
+        const result: ModelInputCatalog = { current: catalog.currentInput(sessionId), latest: null }
+        try {
+          const agent = sessionId === undefined ? undefined : routeCtx.agents.get(sessionId as SessionId)
+          if (agent !== undefined) await routeCtx.systemPrompt.assemble({ scope: agent, agent })
+          result.current = catalog.currentInput(sessionId)
+          if (sessionId !== undefined) {
+            result.latest = await inputs.load(sessionId)
+            const session = routeCtx.sessions.get(sessionId as SessionId)
+            if (result.latest === null && session !== undefined) result.latest = reconstructModelInput(session)
+            if (result.latest !== null) catalog.commitRequest(sessionId, result.latest.request.messages as unknown as Message[])
+          }
+        } catch (error) {
+          result.error = error instanceof Error ? error.message : String(error)
+        }
+        return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } })
+      },
+    }), 'prompt-studio: authenticated complete model input')
+  })
+}
+
 /** Register the live namespace and unified component pipeline. */
-export async function apply(ctx: Context): Promise<void> {
-  const scope: SettingsScope<StudioConfig> = ctx.settings.register(
-    PROMPT_STUDIO_SETTINGS_NAMESPACE,
-    studioConfigSchema,
-    { applies: 'live' },
-  )
+export async function apply(ctx: Context, config: StudioConfig): Promise<void> {
+  ctx.effect(() => ctx.settings.configure({ auto: false }))
   const bindings = new RuntimeBindings()
   const pipeline = new ComponentPipeline(ctx, bindings)
   const catalog = new RuntimeCatalogStore()
+  // Same root as the harness itself: $DSH_HOME when set, otherwise ~/.dsh.
+  const dshHome = process.env['DSH_HOME']?.trim() || join(homedir(), '.dsh')
+  const inputs = new ModelInputStore(join(dshHome, 'prompt-studio', 'requests'))
 
   ctx.systemPrompt.variable('user_input', context => context.agent === undefined
     ? undefined
     : latestUserInput(context.agent))
+  // Opt-in: chat-template `{{user}}` / `<user>` in Studio sections resolve only when a name is configured.
+  const userName = typeof config.userName === 'string' ? config.userName.trim() : ''
+  if (userName !== '') ctx.systemPrompt.variable('user', () => userName)
 
-  ctx.on('system-prompt/assemble', async (assembly, _context: AssembleContext, next) => {
+  ctx.on('system-prompt/assemble', async (assembly, context: AssembleContext, next) => {
     const native = runtimeNative(assembly.sections, bindings.ownedSectionNames)
     applyOverrides(assembly, bindings.overridesByMarker)
     const resolved = await next()
-    catalog.commit(native, effectiveAssembly(resolved.sections, bindings.systemBySection))
+    renderStudioSections(resolved, bindings.ownedSectionNames)
+    catalog.commitTools(context.agent?.session.id ?? '', resolved.tools)
+    const renderedSections = resolved.sections.map(section => ({
+      ...section, text: context.agent === undefined ? section.text : renderPrompt({ ...resolved, sections: [section] }),
+    }))
+    catalog.commit(native, effectiveAssembly(renderedSections, bindings.systemBySection), context.agent?.session.id, resolved.variables)
     return resolved
   }, { prepend: true })
 
@@ -619,7 +690,14 @@ export async function apply(ctx: Context): Promise<void> {
   }
 
   ctx.on('system-prompt/change', requestRefresh)
-  ctx.on('llm/stream', (options, next) => rewriteRequest(catalog, options, next))
+  ctx.on('llm/stream', (options, next) => {
+    if (options.sessionId === undefined || options.purpose !== undefined) return next()
+    const snapshot = captureModelInput(options)
+    return (async function* () {
+      try { await inputs.save(snapshot) } catch { ctx.logger.warn('prompt-studio: complete input could not be persisted; retained in memory') }
+      yield* rewriteRequest(catalog, options, next)
+    })()
+  })
   ctx.on('session/created', (session) => {
     try {
       appendInjectionTurn(session, [...bindings.supplements.values()])
@@ -629,14 +707,16 @@ export async function apply(ctx: Context): Promise<void> {
     }
   }, { prepend: true })
   installRoutes(ctx, catalog)
+  installInputRoute(ctx, catalog, inputs)
 
-  const initial = scope.get()
-  validatePromptComponents(initial.components)
-  pipeline.replace(initial.components)
-  ctx.effect(() => scope.watch((next) => {
-    validatePromptComponents(next.components)
+  const initialComponents = (config.components as unknown as { get(): PromptComponent[] }).get()
+  validatePromptComponents(initialComponents)
+  pipeline.replace(initialComponents)
+  ctx.on('settings/document-updated', (namespace) => {
+    if (namespace !== PROMPT_STUDIO_SETTINGS_NAMESPACE) return
+    const next = settingsSnapshot(ctx).value
     pipeline.replace(next.components)
-  }), 'prompt-studio: settings component source')
+  })
 
   await ctx.systemPrompt.assemble()
 }

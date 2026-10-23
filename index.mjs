@@ -1,1609 +1,985 @@
-import { createHash } from "node:crypto";
-import { homedir } from "node:os";
-import { readFile, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-//#region ../dsh-oss/vendor/cosmokit/src/misc.ts
-/** Return true when a value is `null` or `undefined`. */
-function isNullable(value) {
-	return value === null || value === void 0;
-}
-/** Return true for non-array object values. */
-function isPlainObject(data) {
-	return data && typeof data === "object" && !Array.isArray(data);
-}
-/** Filter object entries and return a new object. */
-function filterKeys(object, filter) {
-	return Object.fromEntries(Object.entries(object).filter(([key, value]) => filter(key, value)));
-}
-/** Map object values while preserving the original key set. */
-function mapValues(object, transform) {
-	return Object.fromEntries(Object.entries(object).map(([key, value]) => [key, transform(value, key)]));
-}
-/** Pick selected keys from an object, optionally including `undefined` values. */
-function pick(source, keys, forced) {
-	if (!keys) return { ...source };
-	const result = {};
-	for (const key of keys) if (forced || source[key] !== void 0) result[key] = source[key];
-	return result;
-}
-//#endregion
-//#region ../dsh-oss/vendor/cosmokit/src/types.ts
-/** Test values using `instanceof` with a `toStringTag` fallback. */
-function is(type, value) {
-	if (arguments.length === 1) return (value) => is(type, value);
-	return type in globalThis && value instanceof globalThis[type] || Object.prototype.toString.call(value).slice(8, -1) === type;
-}
-function isArrayBufferLike(value) {
-	return is("ArrayBuffer", value) || is("SharedArrayBuffer", value);
-}
-function isArrayBufferSource(value) {
-	return isArrayBufferLike(value) || ArrayBuffer.isView(value);
-}
-let Binary;
-(function(_Binary) {
-	_Binary.is = isArrayBufferLike;
-	_Binary.isSource = isArrayBufferSource;
-	function fromSource(source) {
-		if (ArrayBuffer.isView(source)) return source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength);
-		else return source;
-	}
-	_Binary.fromSource = fromSource;
-	function toBase64(source) {
-		source = fromSource(source);
-		if (typeof Buffer !== "undefined") return Buffer.from(source).toString("base64");
-		let binary = "";
-		const bytes = new Uint8Array(source);
-		for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-		return btoa(binary);
-	}
-	_Binary.toBase64 = toBase64;
-	function fromBase64(source) {
-		if (typeof Buffer !== "undefined") return fromSource(Buffer.from(source, "base64"));
-		return Uint8Array.from(atob(source), (c) => c.charCodeAt(0));
-	}
-	_Binary.fromBase64 = fromBase64;
-	function toHex(source) {
-		source = fromSource(source);
-		if (typeof Buffer !== "undefined") return Buffer.from(source).toString("hex");
-		return Array.from(new Uint8Array(source), (byte) => byte.toString(16).padStart(2, "0")).join("");
-	}
-	_Binary.toHex = toHex;
-	function fromHex(source) {
-		if (typeof Buffer !== "undefined") return fromSource(Buffer.from(source, "hex"));
-		const hex = source.length % 2 === 0 ? source : source.slice(0, source.length - 1);
-		const buffer = [];
-		for (let i = 0; i < hex.length; i += 2) buffer.push(parseInt(`${hex[i]}${hex[i + 1]}`, 16));
-		return Uint8Array.from(buffer).buffer;
-	}
-	_Binary.fromHex = fromHex;
-})(Binary || (Binary = {}));
-Binary.fromBase64;
-Binary.toBase64;
-Binary.fromHex;
-Binary.toHex;
-/** Deep-clone common JavaScript values while preserving prototypes and cycles. */
-function clone(source, refs = /* @__PURE__ */ new Map()) {
-	if (!source || typeof source !== "object") return source;
-	if (is("Date", source)) return new Date(source.valueOf());
-	if (is("RegExp", source)) return new RegExp(source.source, source.flags);
-	if (isArrayBufferLike(source)) return source.slice(0);
-	if (ArrayBuffer.isView(source)) return source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength);
-	const cached = refs.get(source);
-	if (cached) return cached;
-	if (Array.isArray(source)) {
-		const result = [];
-		refs.set(source, result);
-		source.forEach((value, index) => {
-			result[index] = Reflect.apply(clone, null, [value, refs]);
-		});
-		return result;
-	}
-	const result = Object.create(Object.getPrototypeOf(source));
-	refs.set(source, result);
-	for (const key of Reflect.ownKeys(source)) {
-		const descriptor = { ...Reflect.getOwnPropertyDescriptor(source, key) };
-		if ("value" in descriptor) descriptor.value = Reflect.apply(clone, null, [descriptor.value, refs]);
-		Reflect.defineProperty(result, key, descriptor);
-	}
-	return result;
-}
-/** Deeply compare arrays, dates, regexps, buffers, and plain object fields. */
-function deepEqual(a, b, strict) {
-	if (a === b) return true;
-	if (!strict && isNullable(a) && isNullable(b)) return true;
-	if (typeof a !== typeof b) return false;
-	if (typeof a !== "object") return false;
-	if (!a || !b) return false;
-	function check(test, then) {
-		return test(a) ? test(b) ? then(a, b) : false : test(b) ? false : void 0;
-	}
-	return check(Array.isArray, (a, b) => a.length === b.length && a.every((item, index) => deepEqual(item, b[index]))) ?? check(is("Date"), (a, b) => a.valueOf() === b.valueOf()) ?? check(is("RegExp"), (a, b) => a.source === b.source && a.flags === b.flags) ?? check(isArrayBufferLike, (a, b) => {
-		if (a.byteLength !== b.byteLength) return false;
-		const viewA = new Uint8Array(a);
-		const viewB = new Uint8Array(b);
-		for (let i = 0; i < viewA.length; i++) if (viewA[i] !== viewB[i]) return false;
-		return true;
-	}) ?? Object.keys({
-		...a,
-		...b
-	}).every((key) => deepEqual(a[key], b[key], strict));
-}
-//#endregion
-//#region ../dsh-oss/vendor/cosmokit/src/time.ts
-let Time;
-(function(_Time) {
-	_Time.millisecond = 1;
-	const second = _Time.second = 1e3;
-	const minute = _Time.minute = second * 60;
-	const hour = _Time.hour = minute * 60;
-	const day = _Time.day = hour * 24;
-	const week = _Time.week = day * 7;
-	let timezoneOffset = (/* @__PURE__ */ new Date()).getTimezoneOffset();
-	function setTimezoneOffset(offset) {
-		timezoneOffset = offset;
-	}
-	_Time.setTimezoneOffset = setTimezoneOffset;
-	function getTimezoneOffset() {
-		return timezoneOffset;
-	}
-	_Time.getTimezoneOffset = getTimezoneOffset;
-	function getDateNumber(date = /* @__PURE__ */ new Date(), offset) {
-		if (typeof date === "number") date = new Date(date);
-		if (offset === void 0) offset = timezoneOffset;
-		return Math.floor((date.valueOf() / minute - offset) / 1440);
-	}
-	_Time.getDateNumber = getDateNumber;
-	function fromDateNumber(value, offset) {
-		const date = new Date(value * day);
-		if (offset === void 0) offset = timezoneOffset;
-		return new Date(+date + offset * minute);
-	}
-	_Time.fromDateNumber = fromDateNumber;
-	const numeric = /\d+(?:\.\d+)?/.source;
-	const timeRegExp = new RegExp(`^${[
-		"w(?:eek(?:s)?)?",
-		"d(?:ay(?:s)?)?",
-		"h(?:our(?:s)?)?",
-		"m(?:in(?:ute)?(?:s)?)?",
-		"s(?:ec(?:ond)?(?:s)?)?"
-	].map((unit) => `(${numeric}${unit})?`).join("")}$`);
-	function parseTime(source) {
-		const capture = timeRegExp.exec(source);
-		if (!capture) return 0;
-		return (parseFloat(capture[1]) * week || 0) + (parseFloat(capture[2]) * day || 0) + (parseFloat(capture[3]) * hour || 0) + (parseFloat(capture[4]) * minute || 0) + (parseFloat(capture[5]) * second || 0);
-	}
-	_Time.parseTime = parseTime;
-	function parseDate(date) {
-		const parsed = parseTime(date);
-		if (parsed) date = Date.now() + parsed;
-		else if (/^\d{1,2}(:\d{1,2}){1,2}$/.test(date)) date = `${(/* @__PURE__ */ new Date()).toLocaleDateString()}-${date}`;
-		else if (/^\d{1,2}-\d{1,2}-\d{1,2}(:\d{1,2}){1,2}$/.test(date)) date = `${(/* @__PURE__ */ new Date()).getFullYear()}-${date}`;
-		return date ? new Date(date) : /* @__PURE__ */ new Date();
-	}
-	_Time.parseDate = parseDate;
-	function format(ms) {
-		const abs = Math.abs(ms);
-		if (abs >= day - hour / 2) return Math.round(ms / day) + "d";
-		else if (abs >= hour - minute / 2) return Math.round(ms / hour) + "h";
-		else if (abs >= minute - second / 2) return Math.round(ms / minute) + "m";
-		else if (abs >= second) return Math.round(ms / second) + "s";
-		return ms + "ms";
-	}
-	_Time.format = format;
-	function toDigits(source, length = 2) {
-		return source.toString().padStart(length, "0");
-	}
-	_Time.toDigits = toDigits;
-	function template(template, time = /* @__PURE__ */ new Date()) {
-		return template.replace("yyyy", time.getFullYear().toString()).replace("yy", time.getFullYear().toString().slice(2)).replace("MM", toDigits(time.getMonth() + 1)).replace("dd", toDigits(time.getDate())).replace("hh", toDigits(time.getHours())).replace("mm", toDigits(time.getMinutes())).replace("ss", toDigits(time.getSeconds())).replace("SSS", toDigits(time.getMilliseconds(), 3));
-	}
-	_Time.template = template;
-})(Time || (Time = {}));
-//#endregion
-//#region ../dsh-oss/vendor/schemastery/src/index.ts
-const kSchema = Symbol.for("schemastery");
-const kValidationError = Symbol.for("ValidationError");
-globalThis.__schemastery_index__ ??= 0;
-globalThis.__schemastery_refs__ = void 0;
-var ValidationError = class extends TypeError {
-	options;
-	name = "ValidationError";
-	constructor(message, options) {
-		let prefix = "$";
-		for (const segment of options.path || []) if (typeof segment === "string") prefix += "." + segment;
-		else if (typeof segment === "number") prefix += "[" + segment + "]";
-		else if (typeof segment === "symbol") prefix += `[Symbol(${segment.toString()})]`;
-		if (prefix.startsWith(".")) prefix = prefix.slice(1);
-		super((prefix === "$" ? "" : `${prefix} `) + message);
-		this.options = options;
-	}
-	static is(error) {
-		return !!error?.[kValidationError];
-	}
-};
-Object.defineProperty(ValidationError.prototype, kValidationError, { value: true });
-const Schema = function(options) {
-	const schema = function(data, options = {}) {
-		return Schema.resolve(data, schema, options)[0];
-	};
-	if (options.refs) {
-		const refs = mapValues(options.refs, (options) => new Schema(options));
-		const getRef = (uid) => refs[uid];
-		for (const key in refs) {
-			const options = refs[key];
-			options.sKey = getRef(options.sKey);
-			options.inner = getRef(options.inner);
-			options.list = options.list && options.list.map(getRef);
-			options.dict = options.dict && mapValues(options.dict, getRef);
-		}
-		return refs[options.uid];
-	}
-	Object.assign(schema, options);
-	if (typeof schema.callback === "string") try {
-		schema.callback = new Function("return " + schema.callback)();
-	} catch {}
-	Object.defineProperty(schema, "uid", { value: globalThis.__schemastery_index__++ });
-	Object.setPrototypeOf(schema, Schema.prototype);
-	schema.meta ||= {};
-	schema.toString = schema.toString.bind(schema);
-	return schema;
-};
-Schema.prototype = Object.create(Function.prototype);
-Schema.prototype[kSchema] = true;
-Object.defineProperty(Schema.prototype, "~standard", { get() {
-	return {
-		version: 1,
-		vendor: "schemastery",
-		validate: (value) => {
-			try {
-				return { value: Schema.resolve(value, this, {})[0] };
-			} catch (error) {
-				if (ValidationError.is(error)) return { issues: [{
-					message: error.message,
-					path: error.options.path
-				}] };
-				throw error;
-			}
-		}
-	};
-} });
-Schema.ValidationError = ValidationError;
-Schema.prototype.toJSON = function toJSON() {
-	if (globalThis.__schemastery_refs__) {
-		globalThis.__schemastery_refs__[this.uid] ??= JSON.parse(JSON.stringify({ ...this }));
-		return this.uid;
-	}
-	globalThis.__schemastery_refs__ = { [this.uid]: { ...this } };
-	globalThis.__schemastery_refs__[this.uid] = JSON.parse(JSON.stringify({ ...this }));
-	const result = {
-		uid: this.uid,
-		refs: globalThis.__schemastery_refs__
-	};
-	globalThis.__schemastery_refs__ = void 0;
-	return result;
-};
-Schema.prototype.set = function set(key, value) {
-	this.dict[key] = value;
-	return this;
-};
-Schema.prototype.push = function push(value) {
-	this.list.push(value);
-	return this;
-};
-function mergeDesc(original, messages) {
-	const result = typeof original === "string" ? { "": original } : { ...original };
-	for (const locale in messages) {
-		const value = messages[locale];
-		if (value?.$description || value?.$desc) result[locale] = value.$description || value.$desc;
-		else if (typeof value === "string") result[locale] = value;
-	}
-	return result;
-}
-function getInner(value) {
-	return value?.$value ?? value?.$inner;
-}
-function extractKeys(data) {
-	return filterKeys(data ?? {}, (key) => !key.startsWith("$"));
-}
-Schema.prototype.i18n = function i18n(messages) {
-	const schema = Schema(this);
-	const desc = mergeDesc(schema.meta.description, messages);
-	if (Object.keys(desc).length) schema.meta.description = desc;
-	if (schema.dict) schema.dict = mapValues(schema.dict, (inner, key) => {
-		return inner.i18n(mapValues(messages, (data) => getInner(data)?.[key] ?? data?.[key]));
-	});
-	if (schema.list) schema.list = schema.list.map((inner, index) => {
-		return inner.i18n(mapValues(messages, (data = {}) => {
-			if (Array.isArray(getInner(data))) return getInner(data)[index];
-			if (Array.isArray(data)) return data[index];
-			return extractKeys(data);
-		}));
-	});
-	if (schema.inner) schema.inner = schema.inner.i18n(mapValues(messages, (data) => {
-		if (getInner(data)) return getInner(data);
-		return extractKeys(data);
-	}));
-	if (schema.sKey) schema.sKey = schema.sKey.i18n(mapValues(messages, (data) => data?.$key));
-	return schema;
-};
-Schema.prototype.extra = function extra(key, value) {
-	const schema = Schema(this);
-	schema.meta = {
-		...schema.meta,
-		[key]: value
-	};
-	return schema;
-};
-for (const key of [
-	"required",
-	"disabled",
-	"collapse",
-	"hidden",
-	"loose"
-]) Object.assign(Schema.prototype, { [key](value = true) {
-	const schema = Schema(this);
-	schema.meta = {
-		...schema.meta,
-		[key]: value
-	};
-	return schema;
-} });
-Schema.prototype.deprecated = function deprecated() {
-	const schema = Schema(this);
-	schema.meta.badges ||= [];
-	schema.meta.badges.push({
-		text: "deprecated",
-		type: "danger"
-	});
-	return schema;
-};
-Schema.prototype.experimental = function experimental() {
-	const schema = Schema(this);
-	schema.meta.badges ||= [];
-	schema.meta.badges.push({
-		text: "experimental",
-		type: "warning"
-	});
-	return schema;
-};
-Schema.prototype.pattern = function pattern(regexp) {
-	const schema = Schema(this);
-	const pattern = pick(regexp, ["source", "flags"]);
-	schema.meta = {
-		...schema.meta,
-		pattern
-	};
-	return schema;
-};
-Schema.prototype.simplify = function simplify(value) {
-	if (deepEqual(value, this.meta.default, this.type === "dict")) return null;
-	if (isNullable(value)) return value;
-	if (this.type === "object" || this.type === "dict") {
-		const result = {};
-		for (const key in value) {
-			const item = (this.type === "object" ? this.dict[key] : this.inner)?.simplify(value[key]);
-			if (this.type === "dict" || !isNullable(item)) result[key] = item;
-		}
-		if (deepEqual(result, this.meta.default, this.type === "dict")) return null;
-		return result;
-	} else if (this.type === "array" || this.type === "tuple") {
-		const result = [];
-		value.forEach((value, index) => {
-			const schema = this.type === "array" ? this.inner : this.list[index];
-			const item = schema ? schema.simplify(value) : value;
-			result.push(item);
-		});
-		return result;
-	} else if (this.type === "intersect") {
-		const result = {};
-		for (const item of this.list) Object.assign(result, item.simplify(value));
-		return result;
-	} else if (this.type === "union") for (const schema of this.list) try {
-		Schema.resolve(value, schema, {});
-		return schema.simplify(value);
-	} catch {}
-	return value;
-};
-Schema.prototype.toString = function toString(inline) {
-	return formatters[this.type]?.(this, inline) ?? `Schema<${this.type}>`;
-};
-Schema.prototype.role = function role(role, extra) {
-	const schema = Schema(this);
-	schema.meta = {
-		...schema.meta,
-		role,
-		extra
-	};
-	return schema;
-};
-for (const key of [
-	"default",
-	"link",
-	"comment",
-	"description",
-	"max",
-	"min",
-	"step"
-]) Object.assign(Schema.prototype, { [key](value) {
-	const schema = Schema(this);
-	schema.meta = {
-		...schema.meta,
-		[key]: value
-	};
-	return schema;
-} });
-const resolvers = {};
-Schema.extend = function extend(type, resolve) {
-	resolvers[type] = resolve;
-};
-Schema.resolve = function resolve(data, schema, options = {}, strict = false) {
-	if (!schema) return [data];
-	if (options.ignore?.(data, schema)) return [data];
-	if (isNullable(data) && schema.type !== "lazy") {
-		if (schema.meta.required) throw new ValidationError(`missing required value`, options);
-		let current = schema;
-		let fallback = schema.meta.default;
-		while (current?.type === "intersect" && isNullable(fallback)) {
-			current = current.list[0];
-			fallback = current?.meta.default;
-		}
-		if (isNullable(fallback)) return [data];
-		data = clone(fallback);
-	}
-	const callback = resolvers[schema.type];
-	if (!callback) throw new ValidationError(`unsupported type "${schema.type}"`, options);
-	try {
-		return callback(data, schema, options, strict);
-	} catch (error) {
-		if (!schema.meta.loose) throw error;
-		return [schema.meta.default];
-	}
-};
-Schema.from = function from(source) {
-	if (isNullable(source)) return Schema.any();
-	else if ([
-		"string",
-		"number",
-		"boolean"
-	].includes(typeof source)) return Schema.const(source).required();
-	else if (source[kSchema]) return source;
-	else if (typeof source === "function") switch (source) {
-		case String: return Schema.string().required();
-		case Number: return Schema.number().required();
-		case Boolean: return Schema.boolean().required();
-		case Function: return Schema.function().required();
-		default: return Schema.is(source).required();
-	}
-	else throw new TypeError(`cannot infer schema from ${source}`);
-};
-Schema.lazy = function lazy(builder) {
-	const toJSON = () => {
-		if (!schema.inner[kSchema]) {
-			schema.inner = schema.builder();
-			schema.inner.meta = {
-				...schema.meta,
-				...schema.inner.meta
-			};
-		}
-		return schema.inner.toJSON();
-	};
-	const schema = new Schema({
-		type: "lazy",
-		builder,
-		inner: { toJSON }
-	});
-	return schema;
-};
-Schema.natural = function natural() {
-	return Schema.number().step(1).min(0);
-};
-Schema.percent = function percent() {
-	return Schema.number().step(.01).min(0).max(1).role("slider");
-};
-Schema.date = function date() {
-	return Schema.union([Schema.is(Date), Schema.transform(Schema.string().role("datetime"), (value, options) => {
-		const date = new Date(value);
-		if (isNaN(+date)) throw new ValidationError(`invalid date "${value}"`, options);
-		return date;
-	}, true)]);
-};
-Schema.regExp = function regExp(flag = "") {
-	return Schema.union([Schema.is(RegExp), Schema.transform(Schema.string().role("regexp", { flag }), (value, options) => {
-		try {
-			return new RegExp(value, flag);
-		} catch (e) {
-			throw new ValidationError(e.message, options);
-		}
-	}, true)]);
-};
-Schema.arrayBuffer = function arrayBuffer(encoding) {
-	return Schema.union([
-		Schema.is(ArrayBuffer),
-		Schema.is(SharedArrayBuffer),
-		Schema.transform(Schema.any(), (value, options) => {
-			if (Binary.isSource(value)) return Binary.fromSource(value);
-			throw new ValidationError(`expected ArrayBufferSource but got ${value}`, options);
-		}, true),
-		...encoding ? [Schema.transform(Schema.string(), (value, options) => {
-			try {
-				return encoding === "base64" ? Binary.fromBase64(value) : Binary.fromHex(value);
-			} catch (e) {
-				throw new ValidationError(e.message, options);
-			}
-		}, true)] : []
-	]);
-};
-Schema.extend("lazy", (data, schema, options, strict) => {
-	if (!schema.inner[kSchema]) {
-		schema.inner = schema.builder();
-		schema.inner.meta = {
-			...schema.meta,
-			...schema.inner.meta
-		};
-	}
-	return Schema.resolve(data, schema.inner, options, strict);
-});
-Schema.extend("any", (data) => {
-	return [data];
-});
-Schema.extend("never", (data, _, options) => {
-	throw new ValidationError(`expected nullable but got ${data}`, options);
-});
-Schema.extend("const", (data, { value }, options) => {
-	if (deepEqual(data, value)) return [value];
-	throw new ValidationError(`expected ${value} but got ${data}`, options);
-});
-function checkWithinRange(data, meta, description, options, skipMin = false) {
-	const { max = Infinity, min = -Infinity } = meta;
-	if (data > max) throw new ValidationError(`expected ${description} <= ${max} but got ${data}`, options);
-	if (data < min && !skipMin) throw new ValidationError(`expected ${description} >= ${min} but got ${data}`, options);
-}
-Schema.extend("string", (data, { meta }, options) => {
-	if (typeof data !== "string") throw new ValidationError(`expected string but got ${data}`, options);
-	if (meta.pattern) {
-		const regexp = new RegExp(meta.pattern.source, meta.pattern.flags);
-		if (!regexp.test(data)) throw new ValidationError(`expect string to match regexp ${regexp}`, options);
-	}
-	checkWithinRange(data.length, meta, "string length", options);
-	return [data];
-});
-function decimalShift(data, digits) {
-	const str = data.toString();
-	if (str.includes("e")) return data * Math.pow(10, digits);
-	const index = str.indexOf(".");
-	if (index === -1) return data * Math.pow(10, digits);
-	const frac = str.slice(index + 1);
-	const integer = str.slice(0, index);
-	if (frac.length <= digits) return +(integer + frac.padEnd(digits, "0"));
-	return +(integer + frac.slice(0, digits) + "." + frac.slice(digits));
-}
-function isMultipleOf(data, min, step) {
-	step = Math.abs(step);
-	if (!/^\d+\.\d+$/.test(step.toString())) return (data - min) % step === 0;
-	const index = step.toString().indexOf(".");
-	const digits = step.toString().slice(index + 1).length;
-	return Math.abs(decimalShift(data, digits) - decimalShift(min, digits)) % decimalShift(step, digits) === 0;
-}
-Schema.extend("number", (data, { meta }, options) => {
-	if (typeof data !== "number") throw new ValidationError(`expected number but got ${data}`, options);
-	checkWithinRange(data, meta, "number", options);
-	const { step } = meta;
-	if (step && !isMultipleOf(data, meta.min ?? 0, step)) throw new ValidationError(`expected number multiple of ${step} but got ${data}`, options);
-	return [data];
-});
-Schema.extend("boolean", (data, _, options) => {
-	if (typeof data === "boolean") return [data];
-	throw new ValidationError(`expected boolean but got ${data}`, options);
-});
-Schema.extend("bitset", (data, { bits, meta }, options) => {
-	let value = 0, keys = [];
-	if (typeof data === "number") {
-		value = data;
-		for (const key in bits) if (data & bits[key]) keys.push(key);
-	} else if (Array.isArray(data)) {
-		keys = data;
-		for (const key of keys) {
-			if (typeof key !== "string") throw new ValidationError(`expected string but got ${key}`, options);
-			if (key in bits) value |= bits[key];
-		}
-	} else throw new ValidationError(`expected number or array but got ${data}`, options);
-	if (value === meta.default) return [value];
-	return [value, keys];
-});
-Schema.extend("function", (data, _, options) => {
-	if (typeof data === "function") return [data];
-	throw new ValidationError(`expected function but got ${data}`, options);
-});
-Schema.extend("is", (data, { constructor }, options) => {
-	if (typeof constructor === "function") {
-		if (data instanceof constructor) return [data];
-		throw new ValidationError(`expected ${constructor.name} but got ${data}`, options);
-	} else {
-		if (isNullable(data)) throw new ValidationError(`expected ${constructor} but got ${data}`, options);
-		let prototype = Object.getPrototypeOf(data);
-		while (prototype) {
-			if (prototype.constructor?.name === constructor) return [data];
-			prototype = Object.getPrototypeOf(prototype);
-		}
-		throw new ValidationError(`expected ${constructor} but got ${data}`, options);
-	}
-});
-function property(data, key, schema, options) {
-	try {
-		const [value, adapted] = Schema.resolve(data[key], schema, {
-			...options,
-			path: [...options.path || [], key]
-		});
-		if (adapted !== void 0) data[key] = adapted;
-		return value;
-	} catch (e) {
-		if (!options?.autofix) throw e;
-		delete data[key];
-		return schema.meta.default;
-	}
-}
-Schema.extend("array", (data, { inner, meta }, options) => {
-	if (!Array.isArray(data)) throw new ValidationError(`expected array but got ${data}`, options);
-	checkWithinRange(data.length, meta, "array length", options, !isNullable(inner.meta.default));
-	return [data.map((_, index) => property(data, index, inner, options))];
-});
-Schema.extend("dict", (data, { inner, sKey }, options, strict) => {
-	if (!isPlainObject(data)) throw new ValidationError(`expected object but got ${data}`, options);
-	const result = {};
-	for (const key in data) {
-		let rKey;
-		try {
-			rKey = Schema.resolve(key, sKey, options)[0];
-		} catch (error) {
-			if (strict) continue;
-			throw error;
-		}
-		result[rKey] = property(data, key, inner, options);
-		data[rKey] = data[key];
-		if (key !== rKey) delete data[key];
-	}
-	return [result];
-});
-Schema.extend("tuple", (data, { list }, options, strict) => {
-	if (!Array.isArray(data)) throw new ValidationError(`expected array but got ${data}`, options);
-	const result = list.map((inner, index) => property(data, index, inner, options));
-	if (strict) return [result];
-	result.push(...data.slice(list.length));
-	return [result];
-});
-function merge(result, data) {
-	for (const key in data) {
-		if (key in result) continue;
-		result[key] = data[key];
-	}
-}
-Schema.extend("object", (data, { dict }, options, strict) => {
-	if (!isPlainObject(data)) throw new ValidationError(`expected object but got ${data}`, options);
-	const result = {};
-	for (const key in dict) {
-		const value = property(data, key, dict[key], options);
-		if (!isNullable(value) || key in data) result[key] = value;
-	}
-	if (!strict) merge(result, data);
-	return [result];
-});
-Schema.extend("union", (data, { list, toString }, options, strict) => {
-	const messages = [];
-	for (const inner of list) try {
-		return Schema.resolve(data, inner, options, strict);
-	} catch (error) {
-		messages.push(error);
-	}
-	throw new ValidationError(`expected ${toString()} but got ${JSON.stringify(data)}`, options);
-});
-Schema.extend("intersect", (data, { list, toString }, options, strict) => {
-	if (!list.length) return [data];
-	let result;
-	for (const inner of list) {
-		const value = Schema.resolve(data, inner, options, true)[0];
-		if (isNullable(value)) continue;
-		if (isNullable(result)) result = value;
-		else if (typeof result !== typeof value) throw new ValidationError(`expected ${toString()} but got ${JSON.stringify(data)}`, options);
-		else if (typeof value === "object") merge(result ??= {}, value);
-		else if (result !== value) throw new ValidationError(`expected ${toString()} but got ${JSON.stringify(data)}`, options);
-	}
-	if (!strict && isPlainObject(data)) merge(result, data);
-	return [result];
-});
-Schema.extend("transform", (data, { inner, callback, preserve }, options) => {
-	const [result, adapted = data] = Schema.resolve(data, inner, options, true);
-	if (preserve) return [callback(result)];
-	else return [callback(result), callback(adapted)];
-});
-const formatters = {};
-function defineMethod(name, keys, format) {
-	formatters[name] = format;
-	Object.assign(Schema, { [name](...args) {
-		const schema = new Schema({ type: name });
-		keys.forEach((key, index) => {
-			switch (key) {
-				case "sKey":
-					schema.sKey = args[index] ?? Schema.string();
-					break;
-				case "inner":
-					schema.inner = Schema.from(args[index]);
-					break;
-				case "list":
-					schema.list = args[index].map(Schema.from);
-					break;
-				case "dict":
-					schema.dict = mapValues(args[index], Schema.from);
-					break;
-				case "bits":
-					schema.bits = {};
-					for (const key in args[index]) {
-						if (typeof args[index][key] !== "number") continue;
-						schema.bits[key] = args[index][key];
-					}
-					break;
-				case "callback": {
-					const callback = schema.callback = args[index];
-					callback["toJSON"] ||= () => callback.toString();
-					break;
-				}
-				case "constructor": {
-					const constructor = schema.constructor = args[index];
-					if (typeof constructor === "function") constructor["toJSON"] ||= () => constructor["name"];
-					break;
-				}
-				default: schema[key] = args[index];
-			}
-		});
-		if (name === "object" || name === "dict") schema.meta.default = {};
-		else if (name === "array" || name === "tuple") schema.meta.default = [];
-		else if (name === "bitset") schema.meta.default = 0;
-		return schema;
-	} });
-}
-defineMethod("is", ["constructor"], ({ constructor }) => {
-	if (typeof constructor === "function") return constructor.name;
-	else return constructor;
-});
-defineMethod("any", [], () => "any");
-defineMethod("never", [], () => "never");
-defineMethod("const", ["value"], ({ value }) => typeof value === "string" ? JSON.stringify(value) : value);
-defineMethod("string", [], () => "string");
-defineMethod("number", [], () => "number");
-defineMethod("boolean", [], () => "boolean");
-defineMethod("bitset", ["bits"], () => "bitset");
-defineMethod("function", [], () => "function");
-defineMethod("array", ["inner"], ({ inner }) => `${inner.toString(true)}[]`);
-defineMethod("dict", ["inner", "sKey"], ({ inner, sKey }) => `{ [key: ${sKey.toString()}]: ${inner.toString()} }`);
-defineMethod("tuple", ["list"], ({ list }) => `[${list.map((inner) => inner.toString()).join(", ")}]`);
-defineMethod("object", ["dict"], ({ dict }) => {
-	if (Object.keys(dict).length === 0) return "{}";
-	return `{ ${Object.entries(dict).map(([key, inner]) => {
-		return `${key}${inner.meta.required ? "" : "?"}: ${inner.toString()}`;
-	}).join(", ")} }`;
-});
-defineMethod("union", ["list"], ({ list }, inline) => {
-	const result = list.map(({ toString: format }) => format()).join(" | ");
-	return inline ? `(${result})` : result;
-});
-defineMethod("intersect", ["list"], ({ list }) => {
-	return `${list.map((inner) => inner.toString(true)).join(" & ")}`;
-});
-defineMethod("transform", [
-	"inner",
-	"callback",
-	"preserve"
-], ({ inner }, isInner) => inner.toString(isInner));
-//#endregion
-//#region src/shared.ts
-/** Settings namespace shared by the Host registration and browser editor. */
-const PROMPT_STUDIO_NAMESPACE = "prompt-studio";
-/** Same-origin endpoint exposing the runtime-discovered prompt inventory. */
-const PROMPT_STUDIO_STATE_PATH = "/prompt-studio/state";
-/** Same-origin endpoint owned by the plugin for its private settings namespace. */
-const PROMPT_STUDIO_SETTINGS_PATH = "/prompt-studio/settings";
-/** Same-origin endpoint for resources declared by captured context producers. */
-const PROMPT_STUDIO_RESOURCE_PATH = "/prompt-studio/resource";
-/** Conversation-view placement: Chat is 0 and Trajectory is 10. */
-const PROMPT_STUDIO_VIEW_ORDER = 20;
-/** Initial order assigned to a newly added supplement. */
-const DEFAULT_SUPPLEMENT_ORDER = 100;
-/** Namespace reserved for ordered replacement markers owned by the Host half. */
-const PROMPT_STUDIO_OVERRIDE_MARKER_PREFIX = "prompt-studio:override-marker:";
-/** Producer id used by Prompt Studio's own request-local messages. */
-const PROMPT_STUDIO_MESSAGE_SOURCE = "moeblack/prompt-studio";
-const KINDS = new Set(["native", "supplement"]);
-const POSITIONS = new Set([
-	"after_system",
-	"anchored",
-	"tail"
-]);
-const ROLES = new Set([
-	"system",
-	"user",
-	"assistant"
-]);
+// src/index.ts
+import { homedir as homedir2 } from "node:os";
+import { join as join3 } from "node:path";
+import { renderPrompt } from "@deepseek-ai/dsh-system-prompt";
+
+// src/config.ts
+import z from "@deepseek-ai/schemastery";
+
+// src/shared.ts
+var PROMPT_STUDIO_NAMESPACE = "prompt-studio";
+var PROMPT_STUDIO_STATE_PATH = "/prompt-studio/state";
+var PROMPT_STUDIO_SETTINGS_PATH = "/prompt-studio/settings";
+var PROMPT_STUDIO_RESOURCE_PATH = "/prompt-studio/resource";
+var PROMPT_STUDIO_INPUT_PATH = "/api/prompt-studio/input";
+var PROMPT_STUDIO_VIEW_ORDER = 20;
+var DEFAULT_SUPPLEMENT_ORDER = 100;
+var PROMPT_STUDIO_OVERRIDE_MARKER_PREFIX = "prompt-studio:override-marker:";
+var PROMPT_STUDIO_MESSAGE_SOURCE = "moeblack/prompt-studio";
+var KINDS = /* @__PURE__ */ new Set(["native", "supplement"]);
+var POSITIONS = /* @__PURE__ */ new Set(["after_system", "anchored", "tail"]);
+var ROLES = /* @__PURE__ */ new Set(["system", "user", "assistant"]);
 function validateIdentifier(value, label) {
-	if (value.length === 0 || value.trim() !== value) throw new TypeError(`${label} must be non-empty and have no surrounding whitespace`);
+  if (value.length === 0 || value.trim() !== value) {
+    throw new TypeError(`${label} must be non-empty and have no surrounding whitespace`);
+  }
 }
-/** Return whether a supplement targets one runtime-native component. */
 function isNativeOverride(component) {
-	return component.kind === "supplement" && component.origin !== void 0;
+  return component.kind === "supplement" && component.origin !== void 0;
 }
-/**
-* Validate configured or runtime component rows.
-* @param components - rows to validate.
-* @param allowNative - whether runtime-only native rows are accepted.
-*/
 function validatePromptComponents(components, allowNative = false) {
-	const ids = /* @__PURE__ */ new Set();
-	const overrideTargets = /* @__PURE__ */ new Set();
-	for (const component of components) {
-		validateIdentifier(component.id, "prompt component ids");
-		if (!KINDS.has(component.kind)) throw new TypeError(`prompt component "${component.id}" has an invalid kind`);
-		if (!ROLES.has(component.role)) throw new TypeError(`prompt component "${component.id}" has an invalid role`);
-		if (component.role === "system") {
-			if (component.position !== void 0) throw new TypeError(`system prompt component "${component.id}" cannot define a message position`);
-		} else if (component.position === void 0 || !POSITIONS.has(component.position)) throw new TypeError(`message prompt component "${component.id}" has an invalid position`);
-		if (component.blockType !== void 0) {
-			if (component.blockType !== "text" && component.blockType !== "reasoning") throw new TypeError(`prompt component "${component.id}" has an invalid block type`);
-			if (component.role !== "assistant") throw new TypeError(`prompt component "${component.id}" blockType applies only to assistant components`);
-		}
-		if (!Number.isFinite(component.order)) throw new TypeError(`prompt component "${component.id}" order must be a finite number`);
-		if (component.id.startsWith("prompt-studio:override-marker:")) throw new TypeError(`prompt component ids beginning with "${PROMPT_STUDIO_OVERRIDE_MARKER_PREFIX}" are reserved`);
-		if (ids.has(component.id)) throw new TypeError(`prompt component "${component.id}" is listed more than once`);
-		ids.add(component.id);
-		if (component.kind === "native") {
-			if (!allowNative) throw new TypeError(`native prompt component "${component.id}" cannot be persisted`);
-			if (component.origin !== void 0) throw new TypeError(`native prompt component "${component.id}" cannot override another component`);
-			if (component.role !== "system") throw new TypeError(`native prompt component "${component.id}" must use the system role`);
-			continue;
-		}
-		if (component.origin === void 0) continue;
-		validateIdentifier(component.origin, `supplement "${component.id}" native target`);
-		if (overrideTargets.has(component.origin)) throw new TypeError(`native prompt component "${component.origin}" is overridden more than once`);
-		overrideTargets.add(component.origin);
-	}
+  const ids = /* @__PURE__ */ new Set();
+  const overrideTargets = /* @__PURE__ */ new Set();
+  for (const component of components) {
+    validateIdentifier(component.id, "prompt component ids");
+    if (!KINDS.has(component.kind)) throw new TypeError(`prompt component "${component.id}" has an invalid kind`);
+    if (!ROLES.has(component.role)) throw new TypeError(`prompt component "${component.id}" has an invalid role`);
+    if (component.role === "system") {
+      if (component.position !== void 0) {
+        throw new TypeError(`system prompt component "${component.id}" cannot define a message position`);
+      }
+    } else if (component.position === void 0 || !POSITIONS.has(component.position)) {
+      throw new TypeError(`message prompt component "${component.id}" has an invalid position`);
+    }
+    if (component.blockType !== void 0) {
+      if (component.blockType !== "text" && component.blockType !== "reasoning") {
+        throw new TypeError(`prompt component "${component.id}" has an invalid block type`);
+      }
+      if (component.role !== "assistant") {
+        throw new TypeError(`prompt component "${component.id}" blockType applies only to assistant components`);
+      }
+    }
+    if (!Number.isFinite(component.order)) {
+      throw new TypeError(`prompt component "${component.id}" order must be a finite number`);
+    }
+    if (component.id.startsWith(PROMPT_STUDIO_OVERRIDE_MARKER_PREFIX)) {
+      throw new TypeError(`prompt component ids beginning with "${PROMPT_STUDIO_OVERRIDE_MARKER_PREFIX}" are reserved`);
+    }
+    if (ids.has(component.id)) throw new TypeError(`prompt component "${component.id}" is listed more than once`);
+    ids.add(component.id);
+    if (component.kind === "native") {
+      if (!allowNative) throw new TypeError(`native prompt component "${component.id}" cannot be persisted`);
+      if (component.origin !== void 0) {
+        throw new TypeError(`native prompt component "${component.id}" cannot override another component`);
+      }
+      if (component.role !== "system") {
+        throw new TypeError(`native prompt component "${component.id}" must use the system role`);
+      }
+      continue;
+    }
+    if (component.origin === void 0) continue;
+    validateIdentifier(component.origin, `supplement "${component.id}" native target`);
+    if (overrideTargets.has(component.origin)) {
+      throw new TypeError(`native prompt component "${component.origin}" is overridden more than once`);
+    }
+    overrideTargets.add(component.origin);
+  }
 }
 function uniqueComponentId(preferred, used) {
-	if (!used.has(preferred)) {
-		used.add(preferred);
-		return preferred;
-	}
-	for (let suffix = 2;; suffix += 1) {
-		const candidate = `${preferred}-${String(suffix)}`;
-		if (used.has(candidate)) continue;
-		used.add(candidate);
-		return candidate;
-	}
+  if (!used.has(preferred)) {
+    used.add(preferred);
+    return preferred;
+  }
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${preferred}-${String(suffix)}`;
+    if (used.has(candidate)) continue;
+    used.add(candidate);
+    return candidate;
+  }
 }
-/** Render one supplement as plain content without any wrapper markup. */
 function renderSupplementBoundary(_id, text) {
-	return text;
+  return text;
 }
 function systemPreviewComponent(component) {
-	const snapshot = {
-		...component,
-		template: renderSupplementBoundary(component.id, component.template)
-	};
-	delete snapshot.position;
-	return snapshot;
+  const snapshot = {
+    ...component,
+    template: renderSupplementBoundary(component.id, component.template)
+  };
+  delete snapshot.position;
+  return snapshot;
 }
-/** Resolve overrides and supplements for a draft of the single system slot. */
 function buildDraftSystemComponents(native, configured) {
-	validatePromptComponents(native, true);
-	validatePromptComponents(configured);
-	const nativeIds = new Set(native.map((component) => component.id));
-	const overrides = new Map(configured.filter(isNativeOverride).map((component) => [component.origin, component]));
-	const ordered = native.flatMap((component, declaration) => {
-		if (overrides.get(component.id) === void 0) return component.enabled ? [{
-			component: { ...component },
-			declaration
-		}] : [];
-		return [];
-	});
-	for (const [declaration, component] of configured.entries()) {
-		if (!component.enabled || component.role !== "system") continue;
-		if (component.origin !== void 0 && !nativeIds.has(component.origin)) continue;
-		ordered.push({
-			component: systemPreviewComponent(component),
-			declaration: native.length + declaration
-		});
-	}
-	return ordered.sort((left, right) => left.component.order - right.component.order || left.declaration - right.declaration).map((entry) => entry.component);
+  validatePromptComponents(native, true);
+  validatePromptComponents(configured);
+  const nativeIds = new Set(native.map((component) => component.id));
+  const overrides = new Map(configured.filter(isNativeOverride).map((component) => [component.origin, component]));
+  const ordered = native.flatMap((component, declaration) => {
+    const override = overrides.get(component.id);
+    if (override === void 0) {
+      return component.enabled ? [{ component: { ...component }, declaration }] : [];
+    }
+    return [];
+  });
+  for (const [declaration, component] of configured.entries()) {
+    if (!component.enabled || component.role !== "system") continue;
+    if (component.origin !== void 0 && !nativeIds.has(component.origin)) continue;
+    ordered.push({
+      component: systemPreviewComponent(component),
+      declaration: native.length + declaration
+    });
+  }
+  return ordered.sort((left, right) => left.component.order - right.component.order || left.declaration - right.declaration).map((entry) => entry.component);
 }
-/** Concatenate enabled system components using the Host renderer's blank-line rule. */
-function renderSystemPreview(components) {
-	return components.map((component) => component.template).filter((text) => text.length > 0).join("\n\n");
+function renderKnownVariables(text, variables) {
+  return text.replace(/\{\{([a-z][a-z0-9_]*)\}\}/g, (reference, key) => variableValue(variables, key) ?? reference);
 }
-/** Allocate the first readable supplement id absent from a component draft. */
+function renderStudioText(text, variables) {
+  return text.replace(/<[Uu][Ss][Ee][Rr]>|\{\{([a-z][a-z0-9_]*)\}\}/g, (reference, key) => variableValue(variables, key ?? "user") ?? reference);
+}
+function variableValue(variables, key) {
+  return Object.hasOwn(variables, key) ? variables[key] : void 0;
+}
+function renderStudioSections(assembly, ownedSectionNames) {
+  assembly.sections = assembly.sections.map((section) => section.interpolate === false || !ownedSectionNames.has(section.name) ? section : { ...section, text: renderStudioText(section.text, assembly.variables), interpolate: false });
+}
+function renderSystemPreview(components, variables) {
+  return components.map((component) => variables === void 0 ? component.template : (component.kind === "native" ? renderKnownVariables : renderStudioText)(component.template, variables)).filter((text) => text.length > 0).join("\n\n");
+}
 function nextSupplementId(components) {
-	return uniqueComponentId("supplement:message", new Set(components.map((component) => component.id)));
+  const used = new Set(components.map((component) => component.id));
+  return uniqueComponentId("supplement:message", used);
 }
-/** Allocate a readable id for a supplement overriding one native component. */
 function nextOverrideId(components, target) {
-	const used = new Set(components.map((component) => component.id));
-	return uniqueComponentId(`override:${target}`, used);
+  const used = new Set(components.map((component) => component.id));
+  return uniqueComponentId(`override:${target}`, used);
 }
-//#endregion
-//#region src/config.ts
-const finiteOrder = Schema.transform(Schema.number(), (value) => {
-	if (!Number.isFinite(value)) throw new TypeError("prompt component order must be a finite number");
-	return value;
+
+// src/config.ts
+var finiteOrder = z.transform(z.number(), (value) => {
+  if (!Number.isFinite(value)) throw new TypeError("prompt component order must be a finite number");
+  return value;
 }, true);
-const kindSchema = Schema.union([Schema.const("native"), Schema.const("supplement")]);
-const positionSchema = Schema.union([
-	Schema.const("after_system"),
-	Schema.const("anchored"),
-	Schema.const("tail")
+var kindSchema = z.union([
+  z.const("native"),
+  z.const("supplement")
 ]);
-const roleSchema = Schema.union([
-	Schema.const("system"),
-	Schema.const("user"),
-	Schema.const("assistant")
+var positionSchema = z.union([
+  z.const("after_system"),
+  z.const("anchored"),
+  z.const("tail")
 ]);
-const blockTypeSchema = Schema.union([Schema.const("text"), Schema.const("reasoning")]);
-const componentSchema = Schema.object({
-	id: Schema.string().min(1),
-	kind: kindSchema,
-	role: roleSchema,
-	position: positionSchema.default(void 0),
-	order: finiteOrder,
-	enabled: Schema.boolean().default(true),
-	template: Schema.string(),
-	origin: Schema.string().min(1).default(void 0),
-	blockType: blockTypeSchema.default(void 0)
+var roleSchema = z.union([
+  z.const("system"),
+  z.const("user"),
+  z.const("assistant")
+]);
+var blockTypeSchema = z.union([
+  z.const("text"),
+  z.const("reasoning")
+]);
+var componentSchema = z.object({
+  id: z.string().min(1),
+  kind: kindSchema,
+  role: roleSchema,
+  position: positionSchema.default(void 0),
+  order: z.number(),
+  enabled: z.boolean().default(true),
+  template: z.string(),
+  origin: z.string().min(1).default(void 0),
+  blockType: blockTypeSchema.default(void 0)
 });
-const uniqueComponents = Schema.transform(Schema.array(componentSchema), (components) => {
-	const normalized = components.map((component) => {
-		if (component.role !== "system") return component;
-		if (component.position !== void 0 && component.position !== "after_system") return component;
-		const snapshot = { ...component };
-		delete snapshot.position;
-		return snapshot;
-	});
-	validatePromptComponents(normalized);
-	return normalized;
+var uniqueComponents = z.transform(z.array(componentSchema), (components) => {
+  const normalized = components.map((component) => {
+    if (component.role !== "system") return component;
+    if (component.position !== void 0 && component.position !== "after_system") return component;
+    const snapshot = { ...component };
+    delete snapshot.position;
+    return snapshot;
+  });
+  validatePromptComponents(normalized);
+  return normalized;
 }, true);
-/** Persisted settings schema. Only user-authored supplements are stored. */
-const studioConfigSchema = Schema.object({ components: uniqueComponents.default([]) });
-//#endregion
-//#region src/capture.ts
-const CONVERSATION_SOURCE_KINDS = new Set([
-	"user",
-	"model",
-	"tool"
-]);
+var studioConfigSchema = z.object({
+  components: z.array(componentSchema).default([]).volatile(),
+  userName: z.string().default("").description("Studio \u6BB5\u843D\u91CC {{user}} \u548C <user> \u66FF\u6362\u6210\u4EC0\u4E48\uFF08\u7559\u7A7A\u5219\u4FDD\u6301\u539F\u6837\uFF09\uFF1B\u6539\u540E\u91CD\u542F dsh \u751F\u6548")
+});
+
+// src/capture.ts
+var CONVERSATION_SOURCE_KINDS = /* @__PURE__ */ new Set(["user", "model", "tool"]);
 function sourceRecord(message) {
-	return structuredClone(message.source);
+  return structuredClone(message.source);
 }
 function blockText(block) {
-	const record = block;
-	if ((block.type === "text" || block.type === "reasoning") && typeof record["text"] === "string") return record["text"];
-	return JSON.stringify(block, null, 2);
+  const record = block;
+  if ((block.type === "text" || block.type === "reasoning") && typeof record["text"] === "string") {
+    return record["text"];
+  }
+  return JSON.stringify(block, null, 2);
 }
 function renderMessageContent(message) {
-	return message.content.map(blockText).join("\n\n");
+  return message.content.map(blockText).join("\n\n");
 }
 function instructionResources(source) {
-	if (source["form"] !== "instructions" || !Array.isArray(source["changes"])) return [];
-	const resources = [];
-	for (const change of source["changes"]) {
-		if (typeof change !== "object" || change === null || Array.isArray(change)) continue;
-		const record = change;
-		const action = record["action"];
-		const path = record["path"];
-		const digest = record["digest"];
-		if (action !== "set" && action !== "replace" && action !== "remove" || typeof path !== "string") continue;
-		resources.push({
-			id: `resource:${String(resources.length)}`,
-			path,
-			action,
-			...typeof digest === "string" ? { digest } : {},
-			editable: action !== "remove" && typeof digest === "string"
-		});
-	}
-	return resources;
+  if (source["form"] !== "instructions" || !Array.isArray(source["changes"])) return [];
+  const resources = [];
+  for (const change of source["changes"]) {
+    if (typeof change !== "object" || change === null || Array.isArray(change)) continue;
+    const record = change;
+    const action = record["action"];
+    const path = record["path"];
+    const digest = record["digest"];
+    if (action !== "set" && action !== "replace" && action !== "remove" || typeof path !== "string") continue;
+    resources.push({
+      id: `resource:${String(resources.length)}`,
+      path,
+      action,
+      ...typeof digest === "string" ? { digest } : {},
+      editable: action !== "remove" && typeof digest === "string"
+    });
+  }
+  return resources;
 }
-/** Whether a request message is producer-owned context rather than conversation. */
 function isInjectedContextMessage(message) {
-	const source = message.source;
-	const kind = source["kind"];
-	if (typeof kind !== "string" || CONVERSATION_SOURCE_KINDS.has(kind)) return false;
-	return !(kind === "plugin" && source["plugin"] === "moeblack/prompt-studio");
+  const source = message.source;
+  const kind = source["kind"];
+  if (typeof kind !== "string" || CONVERSATION_SOURCE_KINDS.has(kind)) return false;
+  return !(kind === "plugin" && source["plugin"] === PROMPT_STUDIO_MESSAGE_SOURCE);
 }
-/** Capture every producer-owned context message without knowing its plugin kind in advance. */
 function captureInjectedMessages(messages) {
-	return messages.flatMap((message, order) => {
-		if (!isInjectedContextMessage(message)) return [];
-		const source = sourceRecord(message);
-		const sourceKind = String(source["kind"]);
-		const plugin = source["plugin"];
-		const form = source["form"];
-		const summary = source["summary"];
-		return [{
-			id: `captured:${String(message.id)}`,
-			kind: "captured",
-			role: message.role,
-			order,
-			enabled: true,
-			template: renderMessageContent(message),
-			messageId: String(message.id),
-			sourceKind,
-			producer: sourceKind === "plugin" && typeof plugin === "string" ? plugin : sourceKind,
-			...typeof form === "string" ? { form } : {},
-			...typeof summary === "string" ? { summary } : {},
-			source,
-			resources: instructionResources(source)
-		}];
-	});
+  return messages.flatMap((message, order) => {
+    if (!isInjectedContextMessage(message)) return [];
+    const source = sourceRecord(message);
+    const sourceKind = String(source["kind"]);
+    const plugin = source["plugin"];
+    const form = source["form"];
+    const summary = source["summary"];
+    return [{
+      id: `captured:${String(message.id)}`,
+      kind: "captured",
+      role: message.role,
+      order,
+      enabled: true,
+      template: renderMessageContent(message),
+      messageId: String(message.id),
+      sourceKind,
+      producer: sourceKind === "plugin" && typeof plugin === "string" ? plugin : sourceKind,
+      ...typeof form === "string" ? { form } : {},
+      ...typeof summary === "string" ? { summary } : {},
+      source,
+      resources: instructionResources(source)
+    }];
+  });
 }
-/** Describe the unmodified request gaps used by supplement placement. */
 function requestLayout(messages) {
-	let userAnchor = null;
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index];
-		if (message?.role === "user" && message.source.kind === "user") {
-			userAnchor = index;
-			break;
-		}
-	}
-	return {
-		messageCount: messages.length,
-		userAnchor
-	};
+  let userAnchor = null;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "user" && message.source.kind === "user") {
+      userAnchor = index;
+      break;
+    }
+  }
+  return { messageCount: messages.length, userAnchor };
 }
-//#endregion
-//#region src/resource.ts
-/** Resolution and exact replacement of source-declared instruction files. */
-var CapturedResourceNotFoundError = class extends Error {};
-var CapturedResourceConflictError = class extends Error {};
+
+// src/input.ts
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { Session } from "@deepseek-ai/dsh-session";
+var CALL_FIELDS = ["provider", "model", "reasoningEffort", "messages", "system", "tools", "toolHistory", "temperature", "maxTokens", "stop", "sessionId", "purpose"];
+function captureModelInput(options) {
+  const request = {};
+  for (const field of CALL_FIELDS) {
+    if (options[field] !== void 0) request[field] = options[field];
+  }
+  return {
+    version: 1,
+    source: "captured",
+    sessionId: String(options.sessionId),
+    recordedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    // The call's JSON data is detached; the original options are never modified.
+    request: JSON.parse(JSON.stringify(request))
+  };
+}
+function reconstructModelInput(session) {
+  const events = session.snapshotEvents();
+  const boundary = events.findLastIndex((event) => event.type === "assistant/message" || event.type === "assistant/attempt");
+  if (boundary < 0) return null;
+  const prefix = events.slice(0, boundary);
+  const detached = Session.create(session.id, prefix, session.header, session.inheritedEventCount);
+  const header = detached.requestHeader();
+  if (header === void 0) return null;
+  const result = captureModelInput({
+    ...header.config,
+    messages: detached.deriveMessages(),
+    toolHistory: detached.toolHistory(),
+    ...header.tools === void 0 ? {} : { tools: header.tools },
+    sessionId: session.id
+  });
+  return { ...result, source: "reconstructed", boundarySeq: events[boundary].seq };
+}
+var ModelInputStore = class {
+  constructor(directory) {
+    this.directory = directory;
+  }
+  directory;
+  memory = /* @__PURE__ */ new Map();
+  writes = /* @__PURE__ */ new Map();
+  path(sessionId) {
+    return join(this.directory, `${createHash("sha256").update(sessionId).digest("hex")}.json`);
+  }
+  save(snapshot) {
+    this.memory.set(snapshot.sessionId, structuredClone(snapshot));
+    const task = (this.writes.get(snapshot.sessionId) ?? Promise.resolve()).catch(() => {
+    }).then(async () => {
+      await mkdir(this.directory, { recursive: true });
+      const path = this.path(snapshot.sessionId);
+      const temporary = `${path}.tmp`;
+      await writeFile(temporary, JSON.stringify(snapshot), "utf8");
+      await rename(temporary, path);
+    });
+    this.writes.set(snapshot.sessionId, task);
+    return task;
+  }
+  async load(sessionId) {
+    const cached = this.memory.get(sessionId);
+    if (cached !== void 0) return structuredClone(cached);
+    try {
+      const value = JSON.parse(await readFile(this.path(sessionId), "utf8"));
+      if (value.version !== 1 || value.sessionId !== sessionId || !Array.isArray(value.request?.messages)) {
+        throw new Error("\u5DF2\u4FDD\u5B58\u7684\u5B8C\u6574\u8F93\u5165\u5FEB\u7167\u683C\u5F0F\u65E0\u6548\u3002");
+      }
+      this.memory.set(sessionId, value);
+      return structuredClone(value);
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+  }
+};
+
+// src/resource.ts
+import { createHash as createHash2 } from "node:crypto";
+import { homedir } from "node:os";
+import { readFile as readFile2, writeFile as writeFile2 } from "node:fs/promises";
+import { dirname, isAbsolute, join as join2, resolve } from "node:path";
+var CapturedResourceNotFoundError = class extends Error {
+};
+var CapturedResourceConflictError = class extends Error {
+};
 function sha1(content) {
-	return createHash("sha1").update(content).digest("hex");
+  return createHash2("sha1").update(content).digest("hex");
 }
 function ancestorDirectories(cwd) {
-	const directories = [];
-	let current = resolve(cwd);
-	for (;;) {
-		directories.push(current);
-		const parent = dirname(current);
-		if (parent === current) return directories;
-		current = parent;
-	}
+  const directories = [];
+  let current = resolve(cwd);
+  for (; ; ) {
+    directories.push(current);
+    const parent = dirname(current);
+    if (parent === current) return directories;
+    current = parent;
+  }
 }
 function fixedPath(displayPath) {
-	if (isAbsolute(displayPath)) return resolve(displayPath);
-	if (displayPath.startsWith("$DSH_HOME/")) {
-		const dshHome = process.env["DSH_HOME"];
-		return dshHome === void 0 ? void 0 : join(dshHome, displayPath.slice(10));
-	}
-	if (displayPath.startsWith("~/.dsh/")) return join(homedir(), ".dsh", displayPath.slice(7));
+  if (isAbsolute(displayPath)) return resolve(displayPath);
+  if (displayPath.startsWith("$DSH_HOME/")) {
+    const dshHome = process.env["DSH_HOME"];
+    return dshHome === void 0 ? void 0 : join2(dshHome, displayPath.slice("$DSH_HOME/".length));
+  }
+  if (displayPath.startsWith("~/.dsh/")) {
+    return join2(homedir(), ".dsh", displayPath.slice("~/.dsh/".length));
+  }
+  return void 0;
 }
 async function readable(path) {
-	try {
-		const content = await readFile(path, "utf8");
-		return {
-			path,
-			content,
-			digest: sha1(content)
-		};
-	} catch {
-		return;
-	}
+  try {
+    const content = await readFile2(path, "utf8");
+    return { path, content, digest: sha1(content) };
+  } catch {
+    return void 0;
+  }
 }
 function isReadableFile(file) {
-	return file !== void 0;
+  return file !== void 0;
 }
 async function resolveResource(cwd, resource) {
-	const fixed = fixedPath(resource.path);
-	if (fixed !== void 0) {
-		const file = await readable(fixed);
-		if (file !== void 0) return file;
-		throw new CapturedResourceNotFoundError(`上下文文件不存在或不可读：${resource.path}`);
-	}
-	const candidates = ancestorDirectories(cwd).map((directory) => resolve(directory, resource.path));
-	const readableCandidates = (await Promise.all(candidates.map(readable))).filter(isReadableFile);
-	const matching = resource.digest === void 0 ? [] : readableCandidates.filter((file) => file.digest === resource.digest);
-	if (matching.length === 1) return matching[0];
-	if (matching.length > 1) throw new CapturedResourceConflictError(`上下文文件路径不唯一：${resource.path}`);
-	if (readableCandidates.length === 1) return readableCandidates[0];
-	if (readableCandidates.length > 1) throw new CapturedResourceConflictError(`上下文文件已变化且路径不唯一：${resource.path}`);
-	throw new CapturedResourceNotFoundError(`无法从会话工作目录解析上下文文件：${resource.path}`);
+  const fixed = fixedPath(resource.path);
+  if (fixed !== void 0) {
+    const file = await readable(fixed);
+    if (file !== void 0) return file;
+    throw new CapturedResourceNotFoundError(`\u4E0A\u4E0B\u6587\u6587\u4EF6\u4E0D\u5B58\u5728\u6216\u4E0D\u53EF\u8BFB\uFF1A${resource.path}`);
+  }
+  const candidates = ancestorDirectories(cwd).map((directory) => resolve(directory, resource.path));
+  const readableCandidates = (await Promise.all(candidates.map(readable))).filter(isReadableFile);
+  const matching = resource.digest === void 0 ? [] : readableCandidates.filter((file) => file.digest === resource.digest);
+  if (matching.length === 1) return matching[0];
+  if (matching.length > 1) {
+    throw new CapturedResourceConflictError(`\u4E0A\u4E0B\u6587\u6587\u4EF6\u8DEF\u5F84\u4E0D\u552F\u4E00\uFF1A${resource.path}`);
+  }
+  if (readableCandidates.length === 1) return readableCandidates[0];
+  if (readableCandidates.length > 1) {
+    throw new CapturedResourceConflictError(`\u4E0A\u4E0B\u6587\u6587\u4EF6\u5DF2\u53D8\u5316\u4E14\u8DEF\u5F84\u4E0D\u552F\u4E00\uFF1A${resource.path}`);
+  }
+  throw new CapturedResourceNotFoundError(`\u65E0\u6CD5\u4ECE\u4F1A\u8BDD\u5DE5\u4F5C\u76EE\u5F55\u89E3\u6790\u4E0A\u4E0B\u6587\u6587\u4EF6\uFF1A${resource.path}`);
 }
-/** Load the exact current file selected by one captured instructions transition. */
 async function loadCapturedResource(cwd, resource) {
-	const file = await resolveResource(cwd, resource);
-	return {
-		path: resource.path,
-		content: file.content,
-		digest: file.digest
-	};
+  const file = await resolveResource(cwd, resource);
+  return { path: resource.path, content: file.content, digest: file.digest };
 }
-/** Replace the source file only if it still has the bytes loaded by the editor. */
 async function saveCapturedResource(cwd, resource, content, expectedDigest) {
-	const current = await resolveResource(cwd, resource);
-	if (current.digest !== expectedDigest) throw new CapturedResourceConflictError(`上下文文件已在编辑期间变化：${resource.path}`);
-	await writeFile(current.path, content, "utf8");
-	return {
-		path: resource.path,
-		content,
-		digest: sha1(content)
-	};
+  const current = await resolveResource(cwd, resource);
+  if (current.digest !== expectedDigest) {
+    throw new CapturedResourceConflictError(`\u4E0A\u4E0B\u6587\u6587\u4EF6\u5DF2\u5728\u7F16\u8F91\u671F\u95F4\u53D8\u5316\uFF1A${resource.path}`);
+  }
+  await writeFile2(current.path, content, "utf8");
+  return { path: resource.path, content, digest: sha1(content) };
 }
-//#endregion
-//#region src/index.ts
-/** Branded Host settings key. */
-const PROMPT_STUDIO_SETTINGS_NAMESPACE = PROMPT_STUDIO_NAMESPACE;
-/** Stable Cordis plugin name. */
-const name = "client-ui-prompt-studio";
-/** Host services required by the component and request pipelines. */
-const inject = [
-	"settings",
-	"systemPrompt",
-	"llm",
-	"sessions"
-];
-const SYSTEM_SECTION_PREFIX = "prompt-studio:supplement-section:";
+
+// src/index.ts
+var PROMPT_STUDIO_SETTINGS_NAMESPACE = PROMPT_STUDIO_NAMESPACE;
+var name = "client-ui-prompt-studio";
+var Config = studioConfigSchema;
+var inject = ["settings", "systemPrompt", "llm", "sessions", "agents"];
+var SYSTEM_SECTION_PREFIX = "prompt-studio:supplement-section:";
 function markerName(target) {
-	return `${PROMPT_STUDIO_OVERRIDE_MARKER_PREFIX}${target}`;
+  return `${PROMPT_STUDIO_OVERRIDE_MARKER_PREFIX}${target}`;
 }
 function systemSectionName(id) {
-	return `${SYSTEM_SECTION_PREFIX}${id}`;
+  return `${SYSTEM_SECTION_PREFIX}${id}`;
 }
 function cloneComponent(component) {
-	return { ...component };
+  return { ...component };
 }
-/** Live values contributed by currently active configuration effects. */
 var RuntimeBindings = class {
-	ownedSectionNames = /* @__PURE__ */ new Set();
-	overridesByMarker = /* @__PURE__ */ new Map();
-	systemBySection = /* @__PURE__ */ new Map();
-	supplements = /* @__PURE__ */ new Map();
-	/** Activate one component and return its composed inverse. */
-	activate(ctx, component) {
-		if (component.kind === "native") throw new TypeError(`native prompt component "${component.id}" cannot be activated from settings`);
-		if (isNativeOverride(component)) {
-			const snapshot = {
-				...component,
-				origin: component.origin
-			};
-			const marker = markerName(snapshot.origin);
-			return ctx.effect(function* () {
-				this.ownedSectionNames.add(marker);
-				this.overridesByMarker.set(marker, snapshot);
-				if (snapshot.enabled && snapshot.role === "system") this.systemBySection.set(marker, snapshot);
-				else if (snapshot.enabled) this.supplements.set(snapshot.id, snapshot);
-				yield () => {
-					this.supplements.delete(snapshot.id);
-					this.systemBySection.delete(marker);
-					this.overridesByMarker.delete(marker);
-					this.ownedSectionNames.delete(marker);
-				};
-				yield ctx.systemPrompt.section({
-					name: marker,
-					order: snapshot.order,
-					text: snapshot.enabled && snapshot.role === "system" ? renderSupplementBoundary(snapshot.id, snapshot.template) : ""
-				});
-			}.bind(this), `prompt-studio: override ${snapshot.origin}`);
-		}
-		if (!component.enabled) return ctx.effect(() => () => void 0, `prompt-studio: disabled ${component.id}`);
-		const snapshot = cloneComponent(component);
-		if (snapshot.role === "system") {
-			const sectionName = systemSectionName(snapshot.id);
-			return ctx.effect(function* () {
-				this.ownedSectionNames.add(sectionName);
-				this.systemBySection.set(sectionName, snapshot);
-				yield () => {
-					this.systemBySection.delete(sectionName);
-					this.ownedSectionNames.delete(sectionName);
-				};
-				yield ctx.systemPrompt.section({
-					name: sectionName,
-					order: snapshot.order,
-					text: renderSupplementBoundary(snapshot.id, snapshot.template)
-				});
-			}.bind(this), `prompt-studio: system supplement ${component.id}`);
-		}
-		return ctx.effect(function* () {
-			this.supplements.set(snapshot.id, snapshot);
-			yield () => {
-				this.supplements.delete(snapshot.id);
-			};
-		}.bind(this), `prompt-studio: supplement ${component.id}`);
-	}
+  ownedSectionNames = /* @__PURE__ */ new Set();
+  overridesByMarker = /* @__PURE__ */ new Map();
+  systemBySection = /* @__PURE__ */ new Map();
+  supplements = /* @__PURE__ */ new Map();
+  /** Activate one component and return its composed inverse. */
+  activate(ctx, component) {
+    if (component.kind === "native") throw new TypeError(`native prompt component "${component.id}" cannot be activated from settings`);
+    if (isNativeOverride(component)) {
+      const snapshot2 = { ...component, origin: component.origin };
+      const marker = markerName(snapshot2.origin);
+      return ctx.effect(function* () {
+        this.ownedSectionNames.add(marker);
+        this.overridesByMarker.set(marker, snapshot2);
+        if (snapshot2.enabled && snapshot2.role === "system") {
+          this.systemBySection.set(marker, snapshot2);
+        } else if (snapshot2.enabled) {
+          this.supplements.set(snapshot2.id, snapshot2);
+        }
+        yield () => {
+          this.supplements.delete(snapshot2.id);
+          this.systemBySection.delete(marker);
+          this.overridesByMarker.delete(marker);
+          this.ownedSectionNames.delete(marker);
+        };
+        yield ctx.systemPrompt.section({
+          name: marker,
+          order: snapshot2.order,
+          text: snapshot2.enabled && snapshot2.role === "system" ? renderSupplementBoundary(snapshot2.id, snapshot2.template) : ""
+        });
+      }.bind(this), `prompt-studio: override ${snapshot2.origin}`);
+    }
+    if (!component.enabled) return ctx.effect(() => () => void 0, `prompt-studio: disabled ${component.id}`);
+    const snapshot = cloneComponent(component);
+    if (snapshot.role === "system") {
+      const sectionName = systemSectionName(snapshot.id);
+      return ctx.effect(function* () {
+        this.ownedSectionNames.add(sectionName);
+        this.systemBySection.set(sectionName, snapshot);
+        yield () => {
+          this.systemBySection.delete(sectionName);
+          this.ownedSectionNames.delete(sectionName);
+        };
+        yield ctx.systemPrompt.section({
+          name: sectionName,
+          order: snapshot.order,
+          text: renderSupplementBoundary(snapshot.id, snapshot.template)
+        });
+      }.bind(this), `prompt-studio: system supplement ${component.id}`);
+    }
+    return ctx.effect(function* () {
+      this.supplements.set(snapshot.id, snapshot);
+      yield () => {
+        this.supplements.delete(snapshot.id);
+      };
+    }.bind(this), `prompt-studio: supplement ${component.id}`);
+  }
 };
-/** Replaces a complete configuration by recovering and reapplying one composed effect. */
 var ComponentPipeline = class {
-	ctx;
-	bindings;
-	recover = () => void 0;
-	constructor(ctx, bindings) {
-		this.ctx = ctx;
-		this.bindings = bindings;
-	}
-	replace(components) {
-		validatePromptComponents(components);
-		this.recover();
-		const snapshots = components.map(cloneComponent);
-		this.recover = this.ctx.effect(function* () {
-			for (const component of snapshots) yield this.bindings.activate(this.ctx, component);
-		}.bind(this), "prompt-studio: configured component set");
-	}
+  constructor(ctx, bindings) {
+    this.ctx = ctx;
+    this.bindings = bindings;
+  }
+  ctx;
+  bindings;
+  recover = () => void 0;
+  replace(components) {
+    validatePromptComponents(components);
+    this.recover();
+    const snapshots = components.map(cloneComponent);
+    this.recover = this.ctx.effect(function* () {
+      for (const component of snapshots) yield this.bindings.activate(this.ctx, component);
+    }.bind(this), "prompt-studio: configured component set");
+  }
 };
 function applyOverrides(assembly, overridesByMarker) {
-	const matchedOverrideIds = /* @__PURE__ */ new Set();
-	if (overridesByMarker.size === 0) return matchedOverrideIds;
-	const presentNames = new Set(assembly.sections.map((section) => section.name));
-	const matchedMarkers = /* @__PURE__ */ new Set();
-	const replacedTargets = /* @__PURE__ */ new Set();
-	for (const [marker, override] of overridesByMarker) {
-		if (!presentNames.has(marker) || !presentNames.has(override.origin)) continue;
-		matchedMarkers.add(marker);
-		replacedTargets.add(override.origin);
-		matchedOverrideIds.add(override.id);
-	}
-	assembly.sections = assembly.sections.flatMap((section) => {
-		const override = overridesByMarker.get(section.name);
-		if (override !== void 0) return matchedMarkers.has(section.name) && override.enabled && override.role === "system" ? [section] : [];
-		return replacedTargets.has(section.name) ? [] : [section];
-	});
-	return matchedOverrideIds;
+  const matchedOverrideIds = /* @__PURE__ */ new Set();
+  if (overridesByMarker.size === 0) return matchedOverrideIds;
+  const presentNames = new Set(assembly.sections.map((section) => section.name));
+  const matchedMarkers = /* @__PURE__ */ new Set();
+  const replacedTargets = /* @__PURE__ */ new Set();
+  for (const [marker, override] of overridesByMarker) {
+    if (!presentNames.has(marker) || !presentNames.has(override.origin)) continue;
+    matchedMarkers.add(marker);
+    replacedTargets.add(override.origin);
+    matchedOverrideIds.add(override.id);
+  }
+  const sectionsByName = new Map(assembly.sections.map((section) => [section.name, section]));
+  assembly.sections = assembly.sections.flatMap((section) => {
+    if (overridesByMarker.has(section.name)) return [];
+    if (!replacedTargets.has(section.name)) return [section];
+    const marker = markerName(section.name);
+    const override = overridesByMarker.get(marker);
+    return override.enabled && override.role === "system" ? [sectionsByName.get(marker)] : [];
+  });
+  return matchedOverrideIds;
 }
 function runtimeNative(sections, ownedSectionNames) {
-	return sections.filter((section) => !ownedSectionNames.has(section.name)).map((section, order) => ({
-		id: section.name,
-		kind: "native",
-		role: "system",
-		order,
-		enabled: true,
-		template: section.text
-	}));
+  return sections.filter((section) => !ownedSectionNames.has(section.name)).map((section, order) => ({
+    id: section.name,
+    kind: "native",
+    role: "system",
+    order,
+    enabled: true,
+    template: section.text
+  }));
 }
 function effectiveAssembly(sections, systemBySection) {
-	return sections.map((section, order) => {
-		const supplement = systemBySection.get(section.name);
-		if (supplement !== void 0) {
-			const snapshot = {
-				...supplement,
-				template: section.text
-			};
-			delete snapshot.position;
-			return snapshot;
-		}
-		return {
-			id: section.name,
-			kind: "native",
-			role: "system",
-			order,
-			enabled: true,
-			template: section.text
-		};
-	});
+  return sections.map((section, order) => {
+    const supplement = systemBySection.get(section.name);
+    if (supplement !== void 0) {
+      const snapshot = { ...supplement, template: section.text };
+      delete snapshot.position;
+      return snapshot;
+    }
+    return {
+      id: section.name,
+      kind: "native",
+      role: "system",
+      order,
+      enabled: true,
+      template: section.text
+    };
+  });
 }
-/** Latest value-level snapshot of the runtime registry. */
 var RuntimeCatalogStore = class {
-	revision = 0;
-	native = [];
-	assembled = [];
-	requests = /* @__PURE__ */ new Map();
-	latestSessionId;
-	commit(native, assembled) {
-		const nextNative = native.map(cloneComponent);
-		const nextAssembled = assembled.map(cloneComponent);
-		if (JSON.stringify(nextNative) === JSON.stringify(this.native) && JSON.stringify(nextAssembled) === JSON.stringify(this.assembled)) return;
-		this.native = nextNative;
-		this.assembled = nextAssembled;
-		this.revision += 1;
-	}
-	commitRequest(sessionId, messages) {
-		const next = {
-			captured: captureInjectedMessages(messages),
-			layout: requestLayout(messages)
-		};
-		const previous = this.requests.get(sessionId);
-		this.latestSessionId = sessionId;
-		if (previous !== void 0 && JSON.stringify(previous) === JSON.stringify(next)) return;
-		this.requests.set(sessionId, structuredClone(next));
-		this.revision += 1;
-	}
-	snapshot(requestedSessionId) {
-		const sessionId = requestedSessionId ?? this.latestSessionId;
-		const request = sessionId === void 0 ? void 0 : this.requests.get(sessionId);
-		return {
-			revision: this.revision,
-			native: this.native.map(cloneComponent),
-			assembled: this.assembled.map(cloneComponent),
-			...sessionId === void 0 ? {} : { sessionId },
-			captured: request === void 0 ? [] : structuredClone(request.captured),
-			layout: request === void 0 ? {
-				messageCount: 0,
-				userAnchor: null
-			} : { ...request.layout }
-		};
-	}
-	capturedResource(sessionId, componentId, resourceId) {
-		const resource = (this.requests.get(sessionId)?.captured.find((item) => item.id === componentId))?.resources.find((item) => item.id === resourceId);
-		return resource === void 0 ? void 0 : { ...resource };
-	}
+  tools = /* @__PURE__ */ new Map();
+  assemblyTimes = /* @__PURE__ */ new Map();
+  revision = 0;
+  native = [];
+  assembled = [];
+  requests = /* @__PURE__ */ new Map();
+  latestSessionId;
+  prompts = /* @__PURE__ */ new Map();
+  commitTools(sessionId, tools) {
+    this.tools.set(sessionId, JSON.parse(JSON.stringify(tools ?? [])));
+    this.assemblyTimes.set(sessionId, (/* @__PURE__ */ new Date()).toISOString());
+  }
+  currentInput(sessionId) {
+    return {
+      system: renderSystemPreview(this.snapshot(sessionId).assembled),
+      tools: structuredClone(this.tools.get(sessionId ?? "") ?? []),
+      assembledAt: this.assemblyTimes.get(sessionId ?? "") ?? (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  commit(native, assembled, sessionId, variables = {}) {
+    const nextNative = native.map(cloneComponent);
+    const nextAssembled = assembled.map(cloneComponent);
+    if (sessionId !== void 0) this.prompts.set(sessionId, { native: nextNative, assembled: nextAssembled, variables: { ...variables } });
+    if (JSON.stringify(nextNative) === JSON.stringify(this.native) && JSON.stringify(nextAssembled) === JSON.stringify(this.assembled)) return;
+    this.native = nextNative;
+    this.assembled = nextAssembled;
+    this.revision += 1;
+  }
+  commitRequest(sessionId, messages) {
+    const next = {
+      captured: captureInjectedMessages(messages),
+      layout: requestLayout(messages)
+    };
+    const previous = this.requests.get(sessionId);
+    this.latestSessionId = sessionId;
+    if (previous !== void 0 && JSON.stringify(previous) === JSON.stringify(next)) return;
+    this.requests.set(sessionId, structuredClone(next));
+    this.revision += 1;
+  }
+  snapshot(requestedSessionId) {
+    const sessionId = requestedSessionId ?? this.latestSessionId;
+    const request = sessionId === void 0 ? void 0 : this.requests.get(sessionId);
+    const prompt = sessionId === void 0 ? void 0 : this.prompts.get(sessionId);
+    return {
+      revision: this.revision,
+      variables: { ...prompt?.variables },
+      native: (prompt?.native ?? this.native).map(cloneComponent),
+      assembled: (prompt?.assembled ?? this.assembled).map(cloneComponent),
+      ...sessionId === void 0 ? {} : { sessionId },
+      captured: request === void 0 ? [] : structuredClone(request.captured),
+      layout: request === void 0 ? { messageCount: 0, userAnchor: null } : { ...request.layout }
+    };
+  }
+  capturedResource(sessionId, componentId, resourceId) {
+    const component = this.requests.get(sessionId)?.captured.find((item) => item.id === componentId);
+    const resource = component?.resources.find((item) => item.id === resourceId);
+    return resource === void 0 ? void 0 : { ...resource };
+  }
 };
 function latestUserInput(agent) {
-	for (let index = agent.session.events.length - 1; index >= 0; index -= 1) {
-		const event = agent.session.events[index];
-		if (event?.type !== "user/message") continue;
-		return event.data.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
-	}
+  const events = agent.session.snapshotEvents();
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type !== "user/message") continue;
+    return event.data.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+  }
+  return void 0;
 }
-/** One seed turn folding all configured user/assistant supplements. */
 function injectionSeedTurn(components) {
-	const userText = components.filter((component) => component.role === "user").map((component) => renderSupplementBoundary(component.id, component.template)).join("\n\n");
-	const assistantText = components.filter((component) => component.role === "assistant").map((component) => renderSupplementBoundary(component.id, component.template)).join("\n\n");
-	if (userText.length === 0 && assistantText.length === 0) return void 0;
-	return {
-		userText,
-		assistantText
-	};
+  const userText = components.filter((component) => component.role === "user").map((component) => renderSupplementBoundary(component.id, component.template)).join("\n\n");
+  const assistantText = components.filter((component) => component.role === "assistant").map((component) => renderSupplementBoundary(component.id, component.template)).join("\n\n");
+  if (userText.length === 0 && assistantText.length === 0) return void 0;
+  return { userText, assistantText };
 }
-/**
-* Append the configured injection dialogue as the session seed turn (turn 0,
-* before the agent's first real turn). The user message carries a plain user
-* source so message-edit treats it as the turn's user input; the assistant
-* message keeps plugin provenance for tracing.
-*/
 function appendInjectionTurn(session, components) {
-	const seed = injectionSeedTurn(components);
-	if (seed === void 0) return;
-	const { userText, assistantText } = seed;
-	const turn = 0;
-	session.append("turn/start", { turn });
-	session.append("step/start", {
-		turn,
-		step: 1
-	});
-	if (userText.length > 0) session.append("user/message", {
-		id: crypto.randomUUID(),
-		role: "user",
-		content: [{
-			type: "text",
-			text: userText
-		}],
-		source: { kind: "user" }
-	}, { surfaceOp: "append" });
-	if (assistantText.length > 0) session.append("assistant/message", {
-		turn,
-		step: 1,
-		message: {
-			id: crypto.randomUUID(),
-			role: "assistant",
-			content: [{
-				type: "text",
-				text: assistantText
-			}],
-			source: {
-				kind: "plugin",
-				plugin: PROMPT_STUDIO_MESSAGE_SOURCE
-			}
-		}
-	}, { surfaceOp: "append" });
-	session.append("step/end", {
-		turn,
-		step: 1
-	});
-	session.append("turn/end", {
-		turn,
-		reason: { kind: "completed" }
-	});
+  const seed = injectionSeedTurn(components);
+  if (seed === void 0) return;
+  const { userText, assistantText } = seed;
+  const turn = 0;
+  session.append("turn/start", { turn });
+  session.append("step/start", { turn, step: 1 });
+  if (userText.length > 0) {
+    session.append("user/message", {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: [{ type: "text", text: userText }],
+      source: { kind: "user" }
+    }, { surfaceOp: "append" });
+  }
+  if (assistantText.length > 0) {
+    session.append("assistant/message", {
+      turn,
+      step: 1,
+      message: {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: [{ type: "text", text: assistantText }],
+        // Plugin provenance kept for tracing; the wire accepts non-model
+        // sources at runtime (verified), the cast satisfies the model-source
+        // type contract of AssistantMessage.
+        source: { kind: "plugin", plugin: PROMPT_STUDIO_MESSAGE_SOURCE }
+      }
+    }, { surfaceOp: "append" });
+  }
+  session.append("step/end", { turn, step: 1 });
+  session.append("turn/end", { turn, reason: { kind: "completed" } });
 }
 function rewriteRequest(catalog, options, next) {
-	if (options.sessionId === void 0 || options.purpose !== void 0) return next();
-	catalog.commitRequest(String(options.sessionId), options.messages);
-	return next();
+  if (options.sessionId === void 0 || options.purpose !== void 0) return next();
+  catalog.commitRequest(String(options.sessionId), options.messages);
+  return next();
 }
 function respondJson(response, status, value, head = false) {
-	const body = JSON.stringify(value);
-	response.writeHead(status, {
-		"content-type": "application/json; charset=utf-8",
-		"cache-control": "no-store"
-	});
-	response.end(head ? void 0 : body);
+  const body = JSON.stringify(value);
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  response.end(head ? void 0 : body);
 }
 function requestJson(request) {
-	return new Promise((resolve, reject) => {
-		const chunks = [];
-		request.on("data", (chunk) => {
-			chunks.push(chunk);
-		});
-		request.on("end", () => {
-			try {
-				resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-			} catch (error) {
-				reject(error);
-			}
-		});
-		request.on("error", reject);
-	});
+  return new Promise((resolve2, reject) => {
+    const chunks = [];
+    request.on("data", (chunk) => {
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      try {
+        resolve2(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    request.on("error", reject);
+  });
 }
 function requestUrl(request) {
-	return new URL(request.url ?? "/", "http://prompt-studio.local");
+  return new URL(request.url ?? "/", "http://prompt-studio.local");
 }
-function requiredString(value, name) {
-	if (typeof value !== "string" || value.length === 0) throw new TypeError(`${name} 必须是非空字符串。`);
-	return value;
+function requiredString(value, name2) {
+  if (typeof value !== "string" || value.length === 0) throw new TypeError(`${name2} \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32\u3002`);
+  return value;
 }
-function requiredText(value, name) {
-	if (typeof value !== "string") throw new TypeError(`${name} 必须是字符串。`);
-	return value;
+function requiredText(value, name2) {
+  if (typeof value !== "string") throw new TypeError(`${name2} \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u3002`);
+  return value;
 }
 function resourceSelectionFromUrl(request) {
-	const params = requestUrl(request).searchParams;
-	return {
-		sessionId: requiredString(params.get("sessionId"), "sessionId"),
-		componentId: requiredString(params.get("componentId"), "componentId"),
-		resourceId: requiredString(params.get("resourceId"), "resourceId")
-	};
+  const params = requestUrl(request).searchParams;
+  return {
+    sessionId: requiredString(params.get("sessionId"), "sessionId"),
+    componentId: requiredString(params.get("componentId"), "componentId"),
+    resourceId: requiredString(params.get("resourceId"), "resourceId")
+  };
 }
 function resourceUpdate(value) {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("请求体必须是 JSON 对象。");
-	const record = value;
-	return {
-		sessionId: requiredString(record["sessionId"], "sessionId"),
-		componentId: requiredString(record["componentId"], "componentId"),
-		resourceId: requiredString(record["resourceId"], "resourceId"),
-		content: requiredText(record["content"], "content"),
-		expectedDigest: requiredString(record["expectedDigest"], "expectedDigest")
-	};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("\u8BF7\u6C42\u4F53\u5FC5\u987B\u662F JSON \u5BF9\u8C61\u3002");
+  }
+  const record = value;
+  return {
+    sessionId: requiredString(record["sessionId"], "sessionId"),
+    componentId: requiredString(record["componentId"], "componentId"),
+    resourceId: requiredString(record["resourceId"], "resourceId"),
+    content: requiredText(record["content"], "content"),
+    expectedDigest: requiredString(record["expectedDigest"], "expectedDigest")
+  };
 }
 function selectedResource(ctx, catalog, selection) {
-	const session = ctx.sessions.get(selection.sessionId);
-	if (session === void 0) throw new CapturedResourceNotFoundError(`会话不存在：${selection.sessionId}`);
-	const resource = catalog.capturedResource(selection.sessionId, selection.componentId, selection.resourceId);
-	if (resource === void 0 || !resource.editable) throw new CapturedResourceNotFoundError("捕获项没有可编辑的文件资源。");
-	return {
-		cwd: session.header.cwd ?? ".",
-		resource
-	};
+  const session = ctx.sessions.get(selection.sessionId);
+  if (session === void 0) {
+    throw new CapturedResourceNotFoundError(`\u4F1A\u8BDD\u4E0D\u5B58\u5728\uFF1A${selection.sessionId}`);
+  }
+  const resource = catalog.capturedResource(
+    selection.sessionId,
+    selection.componentId,
+    selection.resourceId
+  );
+  if (resource === void 0 || !resource.editable) {
+    throw new CapturedResourceNotFoundError("\u6355\u83B7\u9879\u6CA1\u6709\u53EF\u7F16\u8F91\u7684\u6587\u4EF6\u8D44\u6E90\u3002");
+  }
+  return { cwd: session.header.cwd ?? ".", resource };
 }
 function resourceErrorStatus(error) {
-	if (error instanceof TypeError) return 400;
-	if (error instanceof CapturedResourceNotFoundError) return 404;
-	if (error instanceof CapturedResourceConflictError) return 409;
-	return 500;
+  if (error instanceof TypeError) return 400;
+  if (error instanceof CapturedResourceNotFoundError) return 404;
+  if (error instanceof CapturedResourceConflictError) return 409;
+  return 500;
 }
 function settingsSnapshot(ctx) {
-	const descriptor = ctx.settings.describe().find((row) => row.ns === PROMPT_STUDIO_SETTINGS_NAMESPACE);
-	if (descriptor === void 0) throw new Error("prompt-studio settings namespace is not registered");
-	const value = descriptor.value;
-	return {
-		writable: ctx.settings.writable,
-		revision: descriptor.revision,
-		value: { components: value.components.map(cloneComponent) }
-	};
+  const descriptor = ctx.settings.describe().find((row) => row.ns === PROMPT_STUDIO_SETTINGS_NAMESPACE);
+  if (descriptor === void 0) throw new Error("prompt-studio settings namespace is not registered");
+  const value = descriptor.value;
+  return {
+    writable: ctx.settings.writable,
+    revision: descriptor.revision,
+    value: { components: value.components.map(cloneComponent) }
+  };
 }
 function settingsUpdate(value) {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("请求体必须是 JSON 对象。");
-	const record = value;
-	if (!Number.isSafeInteger(record["expectedRevision"]) || record["expectedRevision"] < 0) throw new TypeError("expectedRevision 必须是非负安全整数。");
-	if (!Array.isArray(record["components"])) throw new TypeError("components 必须是数组。");
-	const components = structuredClone(record["components"]);
-	validatePromptComponents(components);
-	return {
-		components,
-		expectedRevision: record["expectedRevision"]
-	};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("\u8BF7\u6C42\u4F53\u5FC5\u987B\u662F JSON \u5BF9\u8C61\u3002");
+  }
+  const record = value;
+  if (!Number.isSafeInteger(record["expectedRevision"]) || record["expectedRevision"] < 0) {
+    throw new TypeError("expectedRevision \u5FC5\u987B\u662F\u975E\u8D1F\u5B89\u5168\u6574\u6570\u3002");
+  }
+  if (!Array.isArray(record["components"])) throw new TypeError("components \u5FC5\u987B\u662F\u6570\u7EC4\u3002");
+  const components = structuredClone(record["components"]);
+  validatePromptComponents(components);
+  return { components, expectedRevision: record["expectedRevision"] };
 }
 function installRoutes(ctx, catalog) {
-	ctx.inject(["webServer"], (routeCtx) => {
-		routeCtx.effect(() => routeCtx.webServer.register({
-			kind: "exact",
-			path: PROMPT_STUDIO_STATE_PATH,
-			handler: (request, response) => {
-				if (request.method !== "GET" && request.method !== "HEAD") {
-					response.writeHead(405);
-					response.end();
-					return;
-				}
-				const sessionId = requestUrl(request).searchParams.get("sessionId") ?? void 0;
-				respondJson(response, 200, catalog.snapshot(sessionId), request.method === "HEAD");
-			}
-		}), "prompt-studio: runtime catalog route");
-		routeCtx.effect(() => routeCtx.webServer.register({
-			kind: "exact",
-			path: PROMPT_STUDIO_SETTINGS_PATH,
-			handler: async (request, response) => {
-				try {
-					if (request.method === "GET" || request.method === "HEAD") {
-						respondJson(response, 200, settingsSnapshot(routeCtx), request.method === "HEAD");
-						return;
-					}
-					if (request.method === "POST") {
-						const update = settingsUpdate(await requestJson(request));
-						await routeCtx.settings.replace(PROMPT_STUDIO_SETTINGS_NAMESPACE, { components: update.components }, update.expectedRevision);
-						respondJson(response, 200, settingsSnapshot(routeCtx));
-						return;
-					}
-					response.writeHead(405);
-					response.end();
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					respondJson(response, error instanceof TypeError ? 400 : 409, { error: message });
-				}
-			}
-		}), "prompt-studio: settings route");
-		routeCtx.effect(() => routeCtx.webServer.register({
-			kind: "exact",
-			path: PROMPT_STUDIO_RESOURCE_PATH,
-			handler: async (request, response) => {
-				try {
-					if (request.method === "GET" || request.method === "HEAD") {
-						const selected = selectedResource(routeCtx, catalog, resourceSelectionFromUrl(request));
-						respondJson(response, 200, await loadCapturedResource(selected.cwd, selected.resource), request.method === "HEAD");
-						return;
-					}
-					if (request.method === "POST") {
-						const update = resourceUpdate(await requestJson(request));
-						const selected = selectedResource(routeCtx, catalog, update);
-						respondJson(response, 200, await saveCapturedResource(selected.cwd, selected.resource, update.content, update.expectedDigest));
-						return;
-					}
-					response.writeHead(405);
-					response.end();
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					respondJson(response, resourceErrorStatus(error), { error: message });
-				}
-			}
-		}), "prompt-studio: captured resource route");
-	});
+  ctx.inject(["webServer"], (routeCtx) => {
+    routeCtx.effect(() => routeCtx.webServer.register({
+      kind: "exact",
+      path: PROMPT_STUDIO_STATE_PATH,
+      handler: async (request, response) => {
+        if (request.method !== "GET" && request.method !== "HEAD") {
+          response.writeHead(405);
+          response.end();
+          return;
+        }
+        const sessionId = requestUrl(request).searchParams.get("sessionId") ?? void 0;
+        const agent = sessionId === void 0 ? void 0 : routeCtx.agents.get(sessionId);
+        try {
+          if (agent !== void 0) await routeCtx.systemPrompt.assemble({ scope: agent, agent });
+          respondJson(response, 200, catalog.snapshot(sessionId), request.method === "HEAD");
+        } catch (error) {
+          respondJson(response, 500, { error: String(error) });
+        }
+      }
+    }), "prompt-studio: runtime catalog route");
+    routeCtx.effect(() => routeCtx.webServer.register({
+      kind: "exact",
+      path: PROMPT_STUDIO_SETTINGS_PATH,
+      handler: async (request, response) => {
+        try {
+          if (request.method === "GET" || request.method === "HEAD") {
+            respondJson(response, 200, settingsSnapshot(routeCtx), request.method === "HEAD");
+            return;
+          }
+          if (request.method === "POST") {
+            const update = settingsUpdate(await requestJson(request));
+            const current = routeCtx.settings.describe().find((row) => row.ns === PROMPT_STUDIO_SETTINGS_NAMESPACE)?.value;
+            await routeCtx.settings.replace(
+              PROMPT_STUDIO_SETTINGS_NAMESPACE,
+              { ...current, components: update.components },
+              update.expectedRevision
+            );
+            respondJson(response, 200, settingsSnapshot(routeCtx));
+            return;
+          }
+          response.writeHead(405);
+          response.end();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          respondJson(response, error instanceof TypeError ? 400 : 409, { error: message });
+        }
+      }
+    }), "prompt-studio: settings route");
+    routeCtx.effect(() => routeCtx.webServer.register({
+      kind: "exact",
+      path: PROMPT_STUDIO_RESOURCE_PATH,
+      handler: async (request, response) => {
+        try {
+          if (request.method === "GET" || request.method === "HEAD") {
+            const selected = selectedResource(routeCtx, catalog, resourceSelectionFromUrl(request));
+            const snapshot = await loadCapturedResource(selected.cwd, selected.resource);
+            respondJson(response, 200, snapshot, request.method === "HEAD");
+            return;
+          }
+          if (request.method === "POST") {
+            const update = resourceUpdate(await requestJson(request));
+            const selected = selectedResource(routeCtx, catalog, update);
+            const snapshot = await saveCapturedResource(
+              selected.cwd,
+              selected.resource,
+              update.content,
+              update.expectedDigest
+            );
+            respondJson(response, 200, snapshot);
+            return;
+          }
+          response.writeHead(405);
+          response.end();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          respondJson(response, resourceErrorStatus(error), { error: message });
+        }
+      }
+    }), "prompt-studio: captured resource route");
+  });
 }
-/** Register the live namespace and unified component pipeline. */
-async function apply(ctx) {
-	const scope = ctx.settings.register(PROMPT_STUDIO_SETTINGS_NAMESPACE, studioConfigSchema, { applies: "live" });
-	const bindings = new RuntimeBindings();
-	const pipeline = new ComponentPipeline(ctx, bindings);
-	const catalog = new RuntimeCatalogStore();
-	ctx.systemPrompt.variable("user_input", (context) => context.agent === void 0 ? void 0 : latestUserInput(context.agent));
-	ctx.on("system-prompt/assemble", async (assembly, _context, next) => {
-		const native = runtimeNative(assembly.sections, bindings.ownedSectionNames);
-		applyOverrides(assembly, bindings.overridesByMarker);
-		const resolved = await next();
-		catalog.commit(native, effectiveAssembly(resolved.sections, bindings.systemBySection));
-		return resolved;
-	}, { prepend: true });
-	let refreshRequested = false;
-	let refreshTask;
-	const requestRefresh = () => {
-		refreshRequested = true;
-		if (refreshTask !== void 0) return;
-		refreshTask = (async () => {
-			while (refreshRequested) {
-				refreshRequested = false;
-				await ctx.systemPrompt.assemble();
-			}
-		})().catch((error) => {
-			ctx.logger.warn("prompt-studio: runtime prompt discovery failed");
-			ctx.logger.warn(error);
-		}).finally(() => {
-			refreshTask = void 0;
-			if (refreshRequested) requestRefresh();
-		});
-	};
-	ctx.on("system-prompt/change", requestRefresh);
-	ctx.on("llm/stream", (options, next) => rewriteRequest(catalog, options, next));
-	ctx.on("session/created", (session) => {
-		try {
-			appendInjectionTurn(session, [...bindings.supplements.values()]);
-		} catch (error) {
-			ctx.logger.warn("prompt-studio: injection seed turn failed");
-			ctx.logger.warn(error);
-		}
-	}, { prepend: true });
-	installRoutes(ctx, catalog);
-	const initial = scope.get();
-	validatePromptComponents(initial.components);
-	pipeline.replace(initial.components);
-	ctx.effect(() => scope.watch((next) => {
-		validatePromptComponents(next.components);
-		pipeline.replace(next.components);
-	}), "prompt-studio: settings component source");
-	await ctx.systemPrompt.assemble();
+function installInputRoute(ctx, catalog, inputs) {
+  ctx.inject(["connection"], (routeCtx) => {
+    routeCtx.effect(() => routeCtx.connection.fetch.register({
+      path: PROMPT_STUDIO_INPUT_PATH,
+      methods: ["GET"],
+      requestBody: "buffered",
+      fetch: async (request) => {
+        const sessionId = new URL(request.url).searchParams.get("sessionId") ?? catalog.snapshot().sessionId;
+        const result = { current: catalog.currentInput(sessionId), latest: null };
+        try {
+          const agent = sessionId === void 0 ? void 0 : routeCtx.agents.get(sessionId);
+          if (agent !== void 0) await routeCtx.systemPrompt.assemble({ scope: agent, agent });
+          result.current = catalog.currentInput(sessionId);
+          if (sessionId !== void 0) {
+            result.latest = await inputs.load(sessionId);
+            const session = routeCtx.sessions.get(sessionId);
+            if (result.latest === null && session !== void 0) result.latest = reconstructModelInput(session);
+            if (result.latest !== null) catalog.commitRequest(sessionId, result.latest.request.messages);
+          }
+        } catch (error) {
+          result.error = error instanceof Error ? error.message : String(error);
+        }
+        return new Response(JSON.stringify(result), { headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+      }
+    }), "prompt-studio: authenticated complete model input");
+  });
 }
-//#endregion
-export { DEFAULT_SUPPLEMENT_ORDER, PROMPT_STUDIO_NAMESPACE, PROMPT_STUDIO_RESOURCE_PATH, PROMPT_STUDIO_SETTINGS_NAMESPACE, PROMPT_STUDIO_SETTINGS_PATH, PROMPT_STUDIO_STATE_PATH, PROMPT_STUDIO_VIEW_ORDER, apply, buildDraftSystemComponents, inject, isNativeOverride, name, nextOverrideId, nextSupplementId, renderSupplementBoundary, renderSystemPreview, studioConfigSchema, validatePromptComponents };
+async function apply(ctx, config) {
+  ctx.effect(() => ctx.settings.configure({ auto: false }));
+  const bindings = new RuntimeBindings();
+  const pipeline = new ComponentPipeline(ctx, bindings);
+  const catalog = new RuntimeCatalogStore();
+  const dshHome = process.env["DSH_HOME"]?.trim() || join3(homedir2(), ".dsh");
+  const inputs = new ModelInputStore(join3(dshHome, "prompt-studio", "requests"));
+  ctx.systemPrompt.variable("user_input", (context) => context.agent === void 0 ? void 0 : latestUserInput(context.agent));
+  const userName = typeof config.userName === "string" ? config.userName.trim() : "";
+  if (userName !== "") ctx.systemPrompt.variable("user", () => userName);
+  ctx.on("system-prompt/assemble", async (assembly, context, next) => {
+    const native = runtimeNative(assembly.sections, bindings.ownedSectionNames);
+    applyOverrides(assembly, bindings.overridesByMarker);
+    const resolved = await next();
+    renderStudioSections(resolved, bindings.ownedSectionNames);
+    catalog.commitTools(context.agent?.session.id ?? "", resolved.tools);
+    const renderedSections = resolved.sections.map((section) => ({
+      ...section,
+      text: context.agent === void 0 ? section.text : renderPrompt({ ...resolved, sections: [section] })
+    }));
+    catalog.commit(native, effectiveAssembly(renderedSections, bindings.systemBySection), context.agent?.session.id, resolved.variables);
+    return resolved;
+  }, { prepend: true });
+  let refreshRequested = false;
+  let refreshTask;
+  const requestRefresh = () => {
+    refreshRequested = true;
+    if (refreshTask !== void 0) return;
+    refreshTask = (async () => {
+      while (refreshRequested) {
+        refreshRequested = false;
+        await ctx.systemPrompt.assemble();
+      }
+    })().catch((error) => {
+      ctx.logger.warn("prompt-studio: runtime prompt discovery failed");
+      ctx.logger.warn(error);
+    }).finally(() => {
+      refreshTask = void 0;
+      if (refreshRequested) requestRefresh();
+    });
+  };
+  ctx.on("system-prompt/change", requestRefresh);
+  ctx.on("llm/stream", (options, next) => {
+    if (options.sessionId === void 0 || options.purpose !== void 0) return next();
+    const snapshot = captureModelInput(options);
+    return (async function* () {
+      try {
+        await inputs.save(snapshot);
+      } catch {
+        ctx.logger.warn("prompt-studio: complete input could not be persisted; retained in memory");
+      }
+      yield* rewriteRequest(catalog, options, next);
+    })();
+  });
+  ctx.on("session/created", (session) => {
+    try {
+      appendInjectionTurn(session, [...bindings.supplements.values()]);
+    } catch (error) {
+      ctx.logger.warn("prompt-studio: injection seed turn failed");
+      ctx.logger.warn(error);
+    }
+  }, { prepend: true });
+  installRoutes(ctx, catalog);
+  installInputRoute(ctx, catalog, inputs);
+  const initialComponents = config.components.get();
+  validatePromptComponents(initialComponents);
+  pipeline.replace(initialComponents);
+  ctx.on("settings/document-updated", (namespace) => {
+    if (namespace !== PROMPT_STUDIO_SETTINGS_NAMESPACE) return;
+    const next = settingsSnapshot(ctx).value;
+    pipeline.replace(next.components);
+  });
+  await ctx.systemPrompt.assemble();
+}
+export {
+  Config,
+  DEFAULT_SUPPLEMENT_ORDER,
+  PROMPT_STUDIO_NAMESPACE,
+  PROMPT_STUDIO_RESOURCE_PATH,
+  PROMPT_STUDIO_SETTINGS_NAMESPACE,
+  PROMPT_STUDIO_SETTINGS_PATH,
+  PROMPT_STUDIO_STATE_PATH,
+  PROMPT_STUDIO_VIEW_ORDER,
+  apply,
+  buildDraftSystemComponents,
+  inject,
+  isNativeOverride,
+  name,
+  nextOverrideId,
+  nextSupplementId,
+  renderSupplementBoundary,
+  renderSystemPreview,
+  studioConfigSchema,
+  validatePromptComponents
+};

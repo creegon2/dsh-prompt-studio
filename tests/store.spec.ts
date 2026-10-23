@@ -6,6 +6,7 @@ const settings = {
   revision: 3,
   value: { components: [] },
 }
+const fullInput = { current: { system: 'System.', tools: [], assembledAt: '2026-10-19T00:00:00Z' }, latest: null }
 
 const captured = {
   id: 'captured:m1',
@@ -46,6 +47,7 @@ describe('PromptStudioStore', () => {
     vi.stubGlobal('fetch', vi.fn((input: string | URL | Request) => {
       const path = String(input)
       requests.push(path)
+      if (path.startsWith('/api/prompt-studio/input')) return Promise.resolve(json(fullInput))
       return Promise.resolve(path.startsWith('/prompt-studio/settings') ? json(settings) : json(catalog))
     }))
     const controller = new PromptStudioStore('session-a')
@@ -66,6 +68,7 @@ describe('PromptStudioStore', () => {
     const bodies: unknown[] = []
     vi.stubGlobal('fetch', vi.fn((input: string | URL | Request, init?: RequestInit) => {
       const path = String(input)
+      if (path.startsWith('/api/prompt-studio/input')) return Promise.resolve(json(fullInput))
       if (path.startsWith('/prompt-studio/settings')) return Promise.resolve(json(settings))
       if (path.startsWith('/prompt-studio/state')) return Promise.resolve(json(catalog))
       if (init?.method === 'POST') {

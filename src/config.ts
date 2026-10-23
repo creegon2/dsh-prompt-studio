@@ -40,7 +40,7 @@ const componentSchema: z<PromptComponent> = z.object({
   kind: kindSchema,
   role: roleSchema,
   position: positionSchema.default(undefined as unknown as PromptComponentPosition),
-  order: finiteOrder,
+  order: z.number(),
   enabled: z.boolean().default(true),
   template: z.string(),
   origin: z.string().min(1).default(undefined as unknown as string),
@@ -61,5 +61,6 @@ const uniqueComponents = z.transform(z.array(componentSchema), (components) => {
 
 /** Persisted settings schema. Only user-authored supplements are stored. */
 export const studioConfigSchema = z.object({
-  components: uniqueComponents.default([]),
+  components: z.array(componentSchema).default([]).volatile(),
+  userName: z.string().default('').description('Studio 段落里 {{user}} 和 <user> 替换成什么（留空则保持原样）；改后重启 dsh 生效'),
 }) as z<StudioConfig>

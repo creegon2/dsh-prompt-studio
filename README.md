@@ -2,6 +2,28 @@
 
 Prompt Studio 的 DeepSeek Harness 插件分发形态。插件在对话页注册 **Prompt Studio** 标签页，以同一组件列表展示运行时原生提示词和用户补充，并提供编辑、原生覆盖与完整请求预览。
 
+> **这是 [Moeblack/dsh-prompt-studio](https://github.com/Moeblack/dsh-prompt-studio) 的分叉（0.5.0）**，在原版 0.4.0 上：
+>
+> - 适配 dsh 0.2.x（在 0.2.1-rc.2 上实测）：设置改走插件 Config、会话事件改用 `snapshotEvents()`、前端注入改为 `@deepseek-ai/dsh-client-ui-settings`。
+> - 新增 **完整模型输入** 视图：按真实顺序查看一次请求的全部消息、system、全部工具定义（完整说明和参数 schema）、注入上下文和整份 JSON，可复制、导出。
+> - Studio 段落里写了没注册的 `{{变量}}`（比如酒馆卡片常见的 `{{user}}`）时原样保留，不再让整份提示词组装报错；可选设置 `userName` 让 `{{user}}` 和 `<user>` 替换成指定称呼。
+> - 构建不再需要 dsh 源码树，`@deepseek-ai/*` 由运行中的 dsh 提供（peerDependencies）。
+>
+> 改动明细见 [CHANGELOG.md](CHANGELOG.md)。安装：`dsh plugin --profile web add github:creegon2/dsh-prompt-studio`，然后重启 `dsh web`。
+>
+> *A fork of Moeblack/dsh-prompt-studio 0.4.0 for dsh 0.2.x: adds a complete model-input inspector (ordered messages, system, full tool schemas, injected context, JSON export), keeps unregistered `{{placeholders}}` in Studio sections literal instead of failing prompt assembly, adds an optional `userName` for `{{user}}` / `<user>`, and builds without a dsh source checkout.*
+
+## 完整模型输入
+
+Prompt Studio 标签页默认打开 **完整模型输入**：
+
+- **全部消息**：本次请求实际交给模型的消息，按顺序列出，每条可展开；**System**：组装好的 system；**工具定义**：每个工具完整的 description 和嵌套参数 schema；**注入上下文**：各插件注入的非对话消息；**完整 JSON**：整份请求。可以复制、导出 JSON，不截断。
+- 数据来源：插件在 `llm/stream` 入口复制这次调用的逻辑参数（消息、system、工具、模型等），**不修改请求，不采集 API key 和 HTTP 鉴权头**。这是插件看到的逻辑输入，不等于适配器最终发出的 HTTP 报文；请求失败（比如 key 无效）也照样能抓到。
+- 每个会话只保留最近一次请求，存在本机 `$DSH_HOME/prompt-studio/requests/`（默认 `~/.dsh/prompt-studio/requests/`），重启后还能看。**里面是完整的对话内容，分享截图或 JSON 前注意隐私。**
+- 装插件之前的旧会话没有捕获记录，会用 dsh 自己的会话折叠逻辑从日志重建最后一次请求，并在界面上标注「日志重建」。
+- 读完整输入的接口 `/api/prompt-studio/input` 走 dsh 已登录的浏览器 API，未登录返回 401。
+- **当前配置（预览）** 只展示当下组装出的 system 和工具，不冒充包含动态上下文的真实请求；**System 编辑器** 就是原版的按段覆盖、补充编辑。
+
 ## 组件模型
 
 每个编排项使用同一结构：
@@ -73,13 +95,25 @@ system 补充直接通过 `systemPrompt.section()` 参与真实组装，不进�
 
 system 组件模板支持 `{{user_input}}` 引用，即当前会话最后一条真实用户输入。该值在每次组装时从 `AssembleContext.agent` 读取，不是保存时快照。
 
-## 设置
+Studio 自己的段落（覆盖段和补充段）里，已注册的变量（`{{model}}`、`{{provider}}`、`{{user_input}}` 等）照常替换；**没注册的 `{{名字}}` 原样保留**，不会像 dsh 原生段落那样让整份提示词组装报错（原生段落仍走 dsh 的严格检查）。预览和真实请求用同一套规则。
 
-`settings.yaml` 中只持久化用户补充组件：
+可选设置 `userName`：设了之后，Studio 段落里的 `{{user}}` 和酒馆（SillyTavern）式的 `<user>`（不分大小写）都替换成这个称呼；留空（默认）则两者都原样保留。改后重启 dsh 生效：
 
 ```yaml
-prompt-studio:
-  components:
+# profile 的 cordis.patch.yml
+- id: prompt-studio
+  config:
+    userName: 主人
+```
+
+## 设置
+
+设置持久化在 profile 的 `cordis.patch.yml` 里插件自己那一条（编辑器保存时写入），只存用户补充组件和可选的 `userName`：
+
+```yaml
+- id: prompt-studio
+  config:
+    components:
     - id: supplement:identity
       kind: supplement
       role: system
@@ -107,30 +141,31 @@ prompt-studio:
 
 ## 安装与启用
 
-Prompt Studio 以**组合包（bundle）**分发：`package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，`dsh.client` 声明浏览器端注入面。安装进一个 profile：
+Prompt Studio 以**组合包（bundle）**分发：`package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，`dsh.client` 声明浏览器端注入面。仓库里已带构建好的 `index.mjs` 和 `client.js`，直接安装进一个 profile：
 
 ```sh
-# 先完成构建（见下），再安装到 profile（profile 名可自取，例如 web）
-dsh plugin --profile web add /path/to/dsh-prompt-studio
+dsh plugin --profile web add github:creegon2/dsh-prompt-studio
 dsh --profile web --dump-config   # 应能看到 "# == dsh-prompt-studio" 层
 dsh web                           # 或 dsh --profile web
 ```
+
+本地改过代码的话，构建后用路径安装：`dsh plugin --profile web add /path/to/dsh-prompt-studio`。
 
 `dsh plugin --profile <name> add <path>` 会把包链接进 profile 并把包名追加进 `dsh.profile.bundles`。已安装的 bundle 通过 `dsh plugin --profile <name> remove dsh-prompt-studio` 移除。命令行与已经运行的 Web 进程不共享内存，因此替换插件产物后需重启 `dsh web` 并刷新浏览器。
 
 ## 构建
 
-构建依赖一个已安装依赖并完成构建的 DSH 源码树：
-
 ```sh
-DSH_ROOT=/path/to/dsh node scripts/build.mjs
+npm install --legacy-peer-deps   # 只装 esbuild；@deepseek-ai/* 由运行中的 dsh 提供，不用装
+npm run build
 ```
 
-构建先运行 TypeScript 项目检查，再由 `tsdown` 生成自包含的服务端 ESM 与浏览器端 bundle，最后写入插件根目录：
+`scripts/build.mjs` 用 esbuild 生成服务端 ESM 和浏览器端 bundle，写入插件根目录：
 
 - `index.mjs`
 - `client.js`
-- `client.js.map`
+
+`@deepseek-ai/*` 一律保留为包名导入（`peerDependencies`），由加载插件的 dsh 提供，产物里不含任何本机路径。原版依赖 dsh 源码树的类型检查和 vitest 测试仍在 `scripts/test.mjs`（`DSH_ROOT=/path/to/dsh npm test`）。
 
 ## 文件
 
@@ -140,11 +175,12 @@ DSH_ROOT=/path/to/dsh node scripts/build.mjs
 | `cordis.patch.yml` | 组合层：把包名插入 profile 的 patch 列表 |
 | `src/index.ts` | 效果管线、动态目录、原生覆盖与种子回合注入 |
 | `src/shared.ts` | 二分组件模型、校验、覆盖判定与预览函数 |
-| `src/config.ts` | 仅含 `components` 的 settings schema |
-| `src/client/` | 统一列表编辑器、运行时目录读取与设置保存 |
-| `scripts/build.mjs` | 类型检查和双端构建 |
+| `src/config.ts` | settings schema：`components` 和可选的 `userName` |
+| `src/input.ts` | 完整模型输入：在 `llm/stream` 捕获、本机持久化、旧会话日志重建 |
+| `src/client/` | 统一列表编辑器、完整模型输入视图、运行时目录读取与设置保存 |
+| `scripts/build.mjs` | esbuild 双端构建 |
 
 ## 已知前提
 
-- 设置命名空间 `prompt-studio` 由插件在加载时自行注册（`applies: 'live'`），宿主无需任何白名单。
+- 设置走插件自己的 Config（命名空间 `prompt-studio`），编辑器保存时只替换 `components`，其他设置项保留。
 - `/prompt-studio/*` HTTP 端点注册在 `webServer` 服务上，仅在 Web 组合下可用；无 Web 时插件仍可正常加载，只是不提供 HTTP 端点与浏览器标签页。

@@ -1,7 +1,7 @@
 {
   "name": "dsh-prompt-studio",
-  "description": "Prompt Studio plugin for DeepSeek Harness: compose runtime prompts, overrides, and request-local synthetic turns in one live editor",
-  "version": "0.4.0",
+  "description": "Prompt Studio for DeepSeek Harness: compose runtime prompts and overrides, and inspect the complete model input (messages, system, tool schemas) of every request",
+  "version": "0.5.0",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
@@ -13,9 +13,10 @@
   "files": [
     "index.mjs",
     "client.js",
-    "client.js.map",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -25,7 +26,7 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-connection",
-        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-api-remotes"
       ]
@@ -33,8 +34,19 @@
   },
   "scripts": {
     "build": "node ./scripts/build.mjs",
-    "test": "node ./scripts/test.mjs",
-    "check": "pnpm run build && pnpm run test"
+    "test": "node ./scripts/test.mjs"
   },
-  "license": "BSD-3-Clause"
+  "license": "BSD-3-Clause",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-session": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/creegon2/dsh-prompt-studio.git"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
 }
