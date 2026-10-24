@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1
+
+- 修复：会话中途工具列表有变化时（MCP 连上、插件启停等），dsh 0.2.x 会在请求里插一条 `developer` 角色的消息（source `tool-registry`，内容是 `tool-addition` / `tool-removal`）。Prompt Studio 把它当作注入上下文捕获，但前端只认 system / user / assistant 三种角色，整个面板报 `prompt-studio captured catalog row N has an invalid shape`。捕获行是只读的，现在接受任何角色；消息缺 `source` 时也不再抛错。
+- Fix: dsh 0.2.x adds a `developer` message (`tool-registry` source) when the tool set changes mid-session; the captured-context decoder rejected that role and the whole panel failed with `captured catalog row N has an invalid shape`. Read-only captured rows now accept any role.
+
 ## 0.5.0 (fork of Moeblack/dsh-prompt-studio 0.4.0)
 
 ### dsh 0.2.x 适配 / dsh 0.2.x compatibility

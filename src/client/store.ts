@@ -133,7 +133,8 @@ function decodeCaptured(value: unknown): CapturedPromptComponent[] {
     if (
       typeof candidate['id'] !== 'string'
       || candidate['kind'] !== 'captured'
-      || typeof role !== 'string' || !ROLES.has(role as PromptComponentRole)
+      // Read-only rows: accept any Host role (dsh 0.2.x injects `developer` messages when tools change mid-session).
+      || typeof role !== 'string' || role.length === 0
       || typeof candidate['order'] !== 'number' || !Number.isSafeInteger(candidate['order'])
       || candidate['enabled'] !== true
       || typeof candidate['template'] !== 'string'
@@ -149,7 +150,7 @@ function decodeCaptured(value: unknown): CapturedPromptComponent[] {
     return {
       id: candidate['id'],
       kind: 'captured',
-      role: role as PromptComponentRole,
+      role,
       order: candidate['order'],
       enabled: true,
       template: candidate['template'],

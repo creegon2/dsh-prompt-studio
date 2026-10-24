@@ -96,7 +96,11 @@ export interface CapturedContextResource {
 export interface CapturedPromptComponent {
   id: string
   kind: 'captured'
-  role: PromptComponentRole
+  /**
+   * Role of the captured request message. Captured rows are read-only, so this is any role the Host sends —
+   * dsh 0.2.x also has `developer` (mid-session tool additions/removals) and `tool` besides the editable three.
+   */
+  role: string
   /** Zero-based position in the unmodified request message sequence. */
   order: number
   enabled: true

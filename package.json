@@ -1,7 +1,7 @@
 {
   "name": "dsh-prompt-studio",
   "description": "Prompt Studio for DeepSeek Harness: compose runtime prompts and overrides, and inspect the complete model input (messages, system, tool schemas) of every request",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "main": "./index.mjs",
   "exports": {

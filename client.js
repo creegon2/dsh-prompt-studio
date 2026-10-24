@@ -232,7 +232,7 @@ function decodeCaptured(value) {
     const candidate = objectRow(entry, "captured catalog", index);
     const source = candidate["source"];
     const role = candidate["role"];
-    if (typeof candidate["id"] !== "string" || candidate["kind"] !== "captured" || typeof role !== "string" || !ROLES2.has(role) || typeof candidate["order"] !== "number" || !Number.isSafeInteger(candidate["order"]) || candidate["enabled"] !== true || typeof candidate["template"] !== "string" || typeof candidate["messageId"] !== "string" || typeof candidate["sourceKind"] !== "string" || typeof candidate["producer"] !== "string" || candidate["form"] !== void 0 && typeof candidate["form"] !== "string" || candidate["summary"] !== void 0 && typeof candidate["summary"] !== "string" || typeof source !== "object" || source === null || Array.isArray(source)) {
+    if (typeof candidate["id"] !== "string" || candidate["kind"] !== "captured" || typeof role !== "string" || role.length === 0 || typeof candidate["order"] !== "number" || !Number.isSafeInteger(candidate["order"]) || candidate["enabled"] !== true || typeof candidate["template"] !== "string" || typeof candidate["messageId"] !== "string" || typeof candidate["sourceKind"] !== "string" || typeof candidate["producer"] !== "string" || candidate["form"] !== void 0 && typeof candidate["form"] !== "string" || candidate["summary"] !== void 0 && typeof candidate["summary"] !== "string" || typeof source !== "object" || source === null || Array.isArray(source)) {
       throw new TypeError(`prompt-studio captured catalog row ${String(index + 1)} has an invalid shape`);
     }
     return {

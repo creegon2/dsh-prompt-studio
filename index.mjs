@@ -197,7 +197,7 @@ var studioConfigSchema = z.object({
 // src/capture.ts
 var CONVERSATION_SOURCE_KINDS = /* @__PURE__ */ new Set(["user", "model", "tool"]);
 function sourceRecord(message) {
-  return structuredClone(message.source);
+  return structuredClone(message.source ?? {});
 }
 function blockText(block) {
   const record = block;
@@ -230,7 +230,7 @@ function instructionResources(source) {
   return resources;
 }
 function isInjectedContextMessage(message) {
-  const source = message.source;
+  const source = message.source ?? {};
   const kind = source["kind"];
   if (typeof kind !== "string" || CONVERSATION_SOURCE_KINDS.has(kind)) return false;
   return !(kind === "plugin" && source["plugin"] === PROMPT_STUDIO_MESSAGE_SOURCE);

@@ -10,7 +10,7 @@ import {
 const CONVERSATION_SOURCE_KINDS = new Set(['user', 'model', 'tool'])
 
 function sourceRecord(message: Message): Record<string, unknown> {
-  return structuredClone(message.source) as unknown as Record<string, unknown>
+  return structuredClone(message.source ?? {}) as unknown as Record<string, unknown>
 }
 
 function blockText(block: ContentBlock): string {
@@ -48,7 +48,7 @@ function instructionResources(source: Record<string, unknown>): CapturedContextR
 
 /** Whether a request message is producer-owned context rather than conversation. */
 export function isInjectedContextMessage(message: Message): boolean {
-  const source = message.source as unknown as Record<string, unknown>
+  const source = (message.source ?? {}) as unknown as Record<string, unknown>
   const kind = source['kind']
   if (typeof kind !== 'string' || CONVERSATION_SOURCE_KINDS.has(kind)) return false
   return !(kind === 'plugin' && source['plugin'] === PROMPT_STUDIO_MESSAGE_SOURCE)
